@@ -1,7 +1,7 @@
 """Nuke menu integration. Add this to your menu.py or source it from there."""
 
 import nuke
-from nuke_mcp_addon import start, stop, is_running
+from nuke_mcp_addon import is_running, start, stop
 
 
 def _toggle():
