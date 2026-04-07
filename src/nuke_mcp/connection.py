@@ -23,6 +23,8 @@ MAX_MSG_SIZE = 16 * 1024 * 1024  # 16MB
 
 _sock: socket.socket | None = None
 _nuke_version: NukeVersion | None = None
+_last_host: str | None = None
+_last_port: int | None = None
 
 
 class ConnectionError(Exception):
@@ -68,7 +70,7 @@ class NukeVersion:
 
 def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
     """Connect to Nuke addon. Returns version info from handshake."""
-    global _sock, _nuke_version
+    global _sock, _nuke_version, _last_host, _last_port
 
     if _sock is not None:
         disconnect()
@@ -87,6 +89,8 @@ def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
             handshake = _recv_json(s)
             _nuke_version = NukeVersion.from_handshake(handshake)
             _sock = s
+            _last_host = host
+            _last_port = port
             log.info("connected to %s on %s:%d", _nuke_version, host, port)
             return _nuke_version
 
@@ -124,18 +128,39 @@ def get_version() -> NukeVersion | None:
     return _nuke_version
 
 
+def _reconnect() -> None:
+    """Try to reconnect using last known host/port."""
+    if _last_host is not None and _last_port is not None:
+        log.info("attempting reconnect to %s:%d", _last_host, _last_port)
+        connect(_last_host, _last_port)
+    else:
+        raise ConnectionError("not connected to Nuke and no previous connection to retry")
+
+
 def send(command: str, **params: Any) -> dict[str, Any]:
     """Send a command to Nuke and return the response.
 
-    Raises ConnectionError if not connected or connection drops.
+    Auto-reconnects once if the connection has dropped.
+    Raises ConnectionError if not connected and reconnect fails.
     Raises CommandError if Nuke reports an error.
     """
+    global _sock
+
     if _sock is None:
-        raise ConnectionError("not connected to Nuke")
+        _reconnect()
+
+    assert _sock is not None  # connect() sets _sock or raises
 
     msg = {"type": command, "params": params}
-    _send_json(_sock, msg)
-    resp = _recv_json(_sock)
+    try:
+        _send_json(_sock, msg)
+        resp = _recv_json(_sock)
+    except (ConnectionError, OSError):
+        disconnect()
+        _reconnect()
+        assert _sock is not None
+        _send_json(_sock, msg)
+        resp = _recv_json(_sock)
 
     if resp.get("status") == "error":
         raise CommandError(resp.get("error", "unknown error"))

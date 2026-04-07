@@ -13,6 +13,7 @@ silently return None. This is the bug in kleer001's implementation.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -44,10 +45,8 @@ def stop() -> None:
     global _running, _server_socket
     _running = False
     if _server_socket:
-        try:
+        with contextlib.suppress(OSError):
             _server_socket.close()
-        except OSError:
-            pass
         _server_socket = None
     log.info("nuke-mcp addon stopped")
 
@@ -68,7 +67,7 @@ def _server_loop(port: int) -> None:
         while _running:
             try:
                 client, addr = _server_socket.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -130,7 +129,7 @@ def _handle_client(client: socket.socket) -> None:
                 resp = _dispatch(msg)
                 _send(client, resp)
 
-        except socket.timeout:
+        except TimeoutError:
             continue
         except OSError:
             break
@@ -167,6 +166,33 @@ def _send(sock: socket.socket, data: dict) -> None:
     sock.sendall(payload + b"\n")
 
 
+# knobs to skip in output -- ui-only, never useful for comp analysis
+_SKIP_KNOBS = frozenset(
+    {
+        "selected",
+        "xpos",
+        "ypos",
+        "postage_stamp",
+        "postage_stamp_frame",
+        "hide_input",
+        "tile_color",
+        "gl_color",
+        "cached",
+        "dope_sheet",
+        "note_font",
+        "note_font_size",
+        "note_font_color",
+        "bookmark",
+        "indicators",
+        "icon",
+        "process_mask",
+        "panel",
+        "lifetimeStart",
+        "lifetimeEnd",
+        "useLifetime",
+    }
+)
+
 # -- command handlers --
 # each takes a params dict and returns a result dict
 # these run on Nuke's main thread via executeInMainThreadWithResult
@@ -200,15 +226,18 @@ def _handle_get_node_info(params: dict) -> dict:
         inp = node.input(i)
         inputs.append(inp.name() if inp else None)
 
-    # only non-default knob values to save tokens
     knobs = {}
     for k in node.knobs():
+        if k in _SKIP_KNOBS:
+            continue
         knob = node.knob(k)
-        if knob.isAnimated() or knob.hasExpression() or (hasattr(knob, "isDefault") and not knob.isDefault()):
-            try:
+        if (
+            knob.isAnimated()
+            or knob.hasExpression()
+            or (hasattr(knob, "isDefault") and not knob.isDefault())
+        ):
+            with contextlib.suppress(Exception):
                 knobs[k] = knob.value()
-            except Exception:
-                pass
 
     return {
         "name": node.name(),
@@ -329,11 +358,13 @@ def _handle_find_nodes(params: dict) -> dict:
             continue
         if errors_only and not n.hasError():
             continue
-        results.append({
-            "name": n.name(),
-            "type": n.Class(),
-            "error": n.hasError(),
-        })
+        results.append(
+            {
+                "name": n.name(),
+                "type": n.Class(),
+                "error": n.hasError(),
+            }
+        )
 
     return {"nodes": results, "count": len(results)}
 
@@ -398,10 +429,7 @@ def _handle_auto_layout(params: dict) -> dict:
     import nuke
 
     selected = params.get("selected_only", False)
-    if selected:
-        nodes = nuke.selectedNodes()
-    else:
-        nodes = nuke.allNodes()
+    nodes = nuke.selectedNodes() if selected else nuke.allNodes()
 
     if not nodes:
         return {"laid_out": 0}
@@ -440,17 +468,21 @@ def _handle_read_comp(params: dict) -> dict:
         if any(inputs):
             entry["inputs"] = inputs
 
-        # only knobs that differ from defaults
-        changed = {}
+        changed: dict[str, Any] = {}
         for k in n.knobs():
+            if k in _SKIP_KNOBS:
+                continue
             knob = n.knob(k)
-            if knob.isAnimated() or knob.hasExpression() or (hasattr(knob, "isDefault") and not knob.isDefault()):
+            if (
+                knob.isAnimated()
+                or knob.hasExpression()
+                or (hasattr(knob, "isDefault") and not knob.isDefault())
+            ):
                 try:
                     val = knob.value()
-                    # skip UI-only knobs and massive data
                     if isinstance(val, str) and len(val) > 500:
                         changed[k] = f"<{len(val)} chars>"
-                    elif isinstance(val, (int, float, str, bool, list)):
+                    elif isinstance(val, int | float | str | bool | list):
                         changed[k] = val
                 except Exception:
                     pass
@@ -473,9 +505,7 @@ def _handle_read_comp(params: dict) -> dict:
         if hasattr(n, "nodes") and depth > 0:
             children = n.nodes()
             if children:
-                entry["children"] = [
-                    {"name": c.name(), "type": c.Class()} for c in children
-                ]
+                entry["children"] = [{"name": c.name(), "type": c.Class()} for c in children]
 
         result.append(entry)
 
@@ -489,8 +519,44 @@ def _handle_read_selected(params: dict) -> dict:
     if not nodes:
         return {"nodes": [], "count": 0}
 
-    # reuse read_comp logic
-    return _handle_read_comp({"root": None, "depth": 1})
+    result = []
+    for n in nodes:
+        entry = {"name": n.name(), "type": n.Class()}
+
+        inputs = []
+        for i in range(n.inputs()):
+            inp = n.input(i)
+            inputs.append(inp.name() if inp else None)
+        if any(inputs):
+            entry["inputs"] = inputs
+
+        changed: dict[str, Any] = {}
+        for k in n.knobs():
+            if k in _SKIP_KNOBS:
+                continue
+            knob = n.knob(k)
+            if (
+                knob.isAnimated()
+                or knob.hasExpression()
+                or (hasattr(knob, "isDefault") and not knob.isDefault())
+            ):
+                try:
+                    val = knob.value()
+                    if isinstance(val, str) and len(val) > 500:
+                        changed[k] = f"<{len(val)} chars>"
+                    elif isinstance(val, int | float | str | bool | list):
+                        changed[k] = val
+                except Exception:
+                    pass
+        if changed:
+            entry["knobs"] = changed
+
+        if n.hasError():
+            entry["error"] = True
+
+        result.append(entry)
+
+    return {"nodes": result, "count": len(result)}
 
 
 def _handle_execute_python(params: dict) -> dict:
@@ -499,14 +565,21 @@ def _handle_execute_python(params: dict) -> dict:
     code = params["code"]
 
     # block dangerous operations
-    dangerous = ["os.remove", "os.rmdir", "shutil.rmtree", "subprocess",
-                 "sys.exit", "nuke.scriptClose", "nuke.scriptClear"]
+    dangerous = [
+        "os.remove",
+        "os.rmdir",
+        "shutil.rmtree",
+        "subprocess",
+        "sys.exit",
+        "nuke.scriptClose",
+        "nuke.scriptClear",
+    ]
     for pattern in dangerous:
         if pattern in code:
             raise ValueError(f"blocked: code contains '{pattern}'")
 
-    result = {}
-    exec_globals = {"nuke": nuke, "__result__": result}
+    result: dict[str, Any] = {}
+    exec_globals: dict[str, Any] = {"nuke": nuke, "__result__": result}
     exec(code, exec_globals)
     return exec_globals.get("__result__", {})
 
@@ -589,6 +662,132 @@ def _handle_view_node(params: dict) -> dict:
     return {"viewing": name}
 
 
+def _handle_set_expression(params: dict) -> dict:
+    import nuke
+
+    node = nuke.toNode(params["node"])
+    if node is None:
+        raise ValueError(f"node not found: {params['node']}")
+    knob = node.knob(params["knob"])
+    if knob is None:
+        raise ValueError(f"knob not found: {params['knob']}")
+    knob.setExpression(params["expression"])
+    return {"node": node.name(), "knob": params["knob"], "expression": params["expression"]}
+
+
+def _handle_clear_expression(params: dict) -> dict:
+    import nuke
+
+    node = nuke.toNode(params["node"])
+    if node is None:
+        raise ValueError(f"node not found: {params['node']}")
+    knob = node.knob(params["knob"])
+    if knob is None:
+        raise ValueError(f"knob not found: {params['knob']}")
+    knob.clearAnimated()
+    return {"node": node.name(), "cleared": params["knob"]}
+
+
+def _handle_set_keyframe(params: dict) -> dict:
+    import nuke
+
+    node = nuke.toNode(params["node"])
+    if node is None:
+        raise ValueError(f"node not found: {params['node']}")
+    knob = node.knob(params["knob"])
+    if knob is None:
+        raise ValueError(f"knob not found: {params['knob']}")
+    if not knob.isAnimated():
+        knob.setAnimated()
+    knob.setValueAt(params["value"], params["frame"])
+    return {
+        "node": node.name(),
+        "knob": params["knob"],
+        "frame": params["frame"],
+        "value": params["value"],
+    }
+
+
+def _handle_list_keyframes(params: dict) -> dict:
+    import nuke
+
+    node = nuke.toNode(params["node"])
+    if node is None:
+        raise ValueError(f"node not found: {params['node']}")
+    knob = node.knob(params["knob"])
+    if knob is None:
+        raise ValueError(f"knob not found: {params['knob']}")
+
+    keyframes = []
+    if knob.isAnimated():
+        for key in knob.animations()[0].keys():  # noqa: SIM118 -- nuke API, not dict
+            keyframes.append({"frame": key.x, "value": key.y})
+    return {"node": node.name(), "knob": params["knob"], "keyframes": keyframes}
+
+
+# server-side snapshot storage for diff_comp
+_snapshots: dict[str, dict] = {}
+_snapshot_counter = 0
+
+
+def _handle_snapshot_comp(params: dict) -> dict:
+    """Take a snapshot of current comp state. Returns a small ID."""
+    global _snapshot_counter
+    _snapshot_counter += 1
+    snap_id = str(_snapshot_counter)
+    _snapshots[snap_id] = _handle_read_comp({})
+    # keep max 5 snapshots to avoid memory bloat
+    if len(_snapshots) > 5:
+        oldest = min(_snapshots.keys(), key=int)
+        del _snapshots[oldest]
+    return {"snapshot_id": snap_id, "node_count": _snapshots[snap_id]["count"]}
+
+
+def _handle_diff_comp(params: dict) -> dict:
+    """Compare current comp to a stored snapshot."""
+    snap_id = params.get("snapshot_id")
+    if not snap_id or snap_id not in _snapshots:
+        available = list(_snapshots.keys())
+        return {"status": "error", "error": f"snapshot not found. available: {available}"}
+
+    before = _snapshots[snap_id]
+    current = _handle_read_comp({})
+
+    before_nodes = {n["name"]: n for n in before.get("nodes", [])}
+    current_nodes = {n["name"]: n for n in current.get("nodes", [])}
+
+    added = [
+        {"name": n["name"], "type": n["type"]}
+        for name, n in current_nodes.items()
+        if name not in before_nodes
+    ]
+    removed = [
+        {"name": n["name"], "type": n["type"]}
+        for name, n in before_nodes.items()
+        if name not in current_nodes
+    ]
+
+    changed = []
+    for name in set(before_nodes) & set(current_nodes):
+        b, c = before_nodes[name], current_nodes[name]
+        diffs = {}
+        if b.get("inputs") != c.get("inputs"):
+            diffs["inputs"] = {"before": b.get("inputs"), "after": c.get("inputs")}
+        bk, ck = b.get("knobs", {}), c.get("knobs", {})
+        if bk != ck:
+            knob_changes = {}
+            for k in set(bk) | set(ck):
+                if bk.get(k) != ck.get(k):
+                    knob_changes[k] = {"before": bk.get(k), "after": ck.get(k)}
+            if knob_changes:
+                diffs["knobs"] = knob_changes
+        if diffs:
+            diffs["name"] = name
+            changed.append(diffs)
+
+    return {"added": added, "removed": removed, "changed": changed}
+
+
 def _handle_list_channels(params: dict) -> dict:
     import nuke
 
@@ -631,4 +830,10 @@ HANDLERS: dict[str, Any] = {
     "set_frame_range": _handle_set_frame_range,
     "view_node": _handle_view_node,
     "list_channels": _handle_list_channels,
+    "set_expression": _handle_set_expression,
+    "clear_expression": _handle_clear_expression,
+    "set_keyframe": _handle_set_keyframe,
+    "list_keyframes": _handle_list_keyframes,
+    "snapshot_comp": _handle_snapshot_comp,
+    "diff_comp": _handle_diff_comp,
 }

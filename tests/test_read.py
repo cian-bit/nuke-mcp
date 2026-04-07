@@ -37,3 +37,20 @@ def test_read_comp_shows_knobs(connected):
 
     g_node = next(n for n in result["nodes"] if n["name"] == "g")
     assert g_node["knobs"]["mix"] == 0.5
+
+
+def test_read_selected_returns_only_selected(connected):
+    connection.send("create_node", type="Grade", name="SelectedGrade")
+    connection.send("create_node", type="Blur", name="NotSelected")
+    connected.selected = {"SelectedGrade"}
+
+    result = connection.send("read_selected")
+    names = [n["name"] for n in result["nodes"]]
+    assert "SelectedGrade" in names
+    assert "NotSelected" not in names
+
+
+def test_read_selected_empty(connected):
+    connection.send("create_node", type="Grade", name="Orphan")
+    result = connection.send("read_selected")
+    assert result["count"] == 0

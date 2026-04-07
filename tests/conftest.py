@@ -19,6 +19,11 @@ class MockNukeServer:
         self.port = port
         self.nodes: dict[str, dict] = {}
         self.connections: dict[str, list[str | None]] = {}
+        self.selected: set[str] = set()
+        self.expressions: dict[str, dict[str, str]] = {}
+        self.keyframes: dict[str, dict[str, list[dict]]] = {}
+        self._snapshots: dict[str, dict] = {}
+        self._snap_counter = 0
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -107,6 +112,12 @@ class MockNukeServer:
             "set_frame_range": self._set_frame_range,
             "view_node": self._view_node,
             "list_channels": self._list_channels,
+            "set_expression": self._set_expression,
+            "clear_expression": self._clear_expression,
+            "set_keyframe": self._set_keyframe,
+            "list_keyframes": self._list_keyframes,
+            "snapshot_comp": self._snapshot_comp,
+            "diff_comp": self._diff_comp,
         }.get(cmd)
 
         if handler is None:
@@ -249,7 +260,22 @@ class MockNukeServer:
         return {"nodes": nodes, "count": len(nodes)}
 
     def _read_selected(self, p: dict) -> dict:
-        return self._read_comp(p)
+        if not self.selected:
+            return {"nodes": [], "count": 0}
+        nodes = []
+        for name in self.selected:
+            if name not in self.nodes:
+                continue
+            data = self.nodes[name]
+            entry: dict[str, Any] = {"name": name, "type": data["type"]}
+            conns = self.connections.get(name, [])
+            if any(conns):
+                entry["inputs"] = conns
+            knobs = data.get("knobs", {})
+            if knobs:
+                entry["knobs"] = knobs
+            nodes.append(entry)
+        return {"nodes": nodes, "count": len(nodes)}
 
     def _execute_python(self, p: dict) -> dict:
         # in tests, just return empty result
@@ -279,6 +305,68 @@ class MockNukeServer:
         if name not in self.nodes:
             raise ValueError(f"node not found: {name}")
         return {"viewing": name}
+
+    def _set_expression(self, p: dict) -> dict:
+        node, knob, expr = p["node"], p["knob"], p["expression"]
+        if node not in self.nodes:
+            raise ValueError(f"node not found: {node}")
+        self.expressions.setdefault(node, {})[knob] = expr
+        return {"node": node, "knob": knob, "expression": expr}
+
+    def _clear_expression(self, p: dict) -> dict:
+        node, knob = p["node"], p["knob"]
+        if node not in self.nodes:
+            raise ValueError(f"node not found: {node}")
+        self.expressions.get(node, {}).pop(knob, None)
+        return {"node": node, "cleared": knob}
+
+    def _set_keyframe(self, p: dict) -> dict:
+        node, knob = p["node"], p["knob"]
+        frame, value = p["frame"], p["value"]
+        if node not in self.nodes:
+            raise ValueError(f"node not found: {node}")
+        kfs = self.keyframes.setdefault(node, {}).setdefault(knob, [])
+        kfs = [k for k in kfs if k["frame"] != frame]
+        kfs.append({"frame": frame, "value": value})
+        kfs.sort(key=lambda k: k["frame"])
+        self.keyframes[node][knob] = kfs
+        return {"node": node, "knob": knob, "frame": frame, "value": value}
+
+    def _list_keyframes(self, p: dict) -> dict:
+        node, knob = p["node"], p["knob"]
+        if node not in self.nodes:
+            raise ValueError(f"node not found: {node}")
+        kfs = self.keyframes.get(node, {}).get(knob, [])
+        return {"node": node, "knob": knob, "keyframes": kfs}
+
+    def _snapshot_comp(self, p: dict) -> dict:
+        self._snap_counter += 1
+        snap_id = str(self._snap_counter)
+        self._snapshots[snap_id] = self._read_comp({})
+        if len(self._snapshots) > 5:
+            oldest = min(self._snapshots.keys(), key=int)
+            del self._snapshots[oldest]
+        return {"snapshot_id": snap_id, "node_count": self._snapshots[snap_id]["count"]}
+
+    def _diff_comp(self, p: dict) -> dict:
+        snap_id = p.get("snapshot_id")
+        if not snap_id or snap_id not in self._snapshots:
+            raise ValueError(f"snapshot not found: {snap_id}")
+        before = self._snapshots[snap_id]
+        current = self._read_comp({})
+        before_nodes = {n["name"]: n for n in before.get("nodes", [])}
+        current_nodes = {n["name"]: n for n in current.get("nodes", [])}
+        added = [
+            {"name": n["name"], "type": n["type"]}
+            for name, n in current_nodes.items()
+            if name not in before_nodes
+        ]
+        removed = [
+            {"name": n["name"], "type": n["type"]}
+            for name, n in before_nodes.items()
+            if name not in current_nodes
+        ]
+        return {"added": added, "removed": removed, "changed": []}
 
     def _list_channels(self, p: dict) -> dict:
         name = p["node"]
