@@ -10,7 +10,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("create_roto")
     def create_roto(input_node: str, roto_type: str = "Roto") -> dict:
         """Create a Roto or RotoPaint node connected to the input.
@@ -33,6 +33,7 @@ __result__ = {{"name": r.name(), "type": r.Class()}}
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("list_roto_shapes")
     def list_roto_shapes(node: str) -> dict:

@@ -10,7 +10,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("view_node")
     def view_node(node: str) -> dict:
         """Set the viewer to display a specific node's output.
@@ -20,7 +20,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("view_node", node=node)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("set_viewer_lut")
     def set_viewer_lut(lut: str) -> dict:
         """Switch the viewer's display LUT/colorspace.

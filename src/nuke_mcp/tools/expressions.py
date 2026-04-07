@@ -10,7 +10,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("set_expression")
     def set_expression(node: str, knob: str, expression: str) -> dict:
         """Set a TCL expression on a knob. The expression is evaluated per-frame.
@@ -24,7 +24,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("set_expression", node=node, knob=knob, expression=expression)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("clear_expression")
     def clear_expression(node: str, knob: str) -> dict:
         """Remove an expression or animation from a knob, leaving it at its current value.
@@ -35,7 +35,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("clear_expression", node=node, knob=knob)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("set_keyframe")
     def set_keyframe(node: str, knob: str, frame: int, value: float) -> dict:
         """Set a keyframe on a knob at a specific frame. Creates animation if
@@ -51,6 +51,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("list_keyframes")
     def list_keyframes(node: str, knob: str) -> dict:

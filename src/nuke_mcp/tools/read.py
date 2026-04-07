@@ -17,26 +17,47 @@ if False:
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("read_comp")
-    def read_comp(root: str | None = None, depth: int = 999) -> dict:
-        """Read the full node graph (or a subtree). Returns every node with its
-        type, connections, non-default knob values, and error state.
+    def read_comp(
+        root: str | None = None,
+        depth: int = 999,
+        summary: bool = False,
+        type: str | None = None,
+        offset: int = 0,
+        limit: int = 0,
+    ) -> dict:
+        """Read the node graph (or a subtree). Returns nodes with type,
+        connections, non-default knob values, and error state.
 
-        Use this to understand a script before making changes. Only knobs that
-        differ from their defaults are included to keep the output compact.
+        For large comps (200+ nodes), use summary=True for a compact overview
+        (names and types only, no knobs), or use offset/limit to paginate.
 
         Args:
             root: read children of this node only (e.g. a Group name). omit for entire script.
             depth: how many levels deep to recurse into groups. default 999.
+            summary: if True, return only name/type/connections per node, skip knobs. faster for large comps.
+            type: filter to only this node class (e.g. 'Grade', 'Read').
+            offset: skip this many nodes (for pagination). default 0.
+            limit: max nodes to return. 0 means all. use with offset to page through large comps.
         """
-        params: dict[str, str | int] = {"depth": depth}
+        params: dict[str, str | int | bool] = {"depth": depth}
         if root:
             params["root"] = root
+        if summary:
+            params["summary"] = True
+        if type:
+            params["type"] = type
+        if offset:
+            params["offset"] = offset
+        if limit:
+            params["limit"] = limit
         return connection.send("read_comp", **params)
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("read_node_detail")
     def read_node_detail(name: str) -> dict:
@@ -51,6 +72,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("read_selected")
     def read_selected() -> dict:
@@ -61,6 +83,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("snapshot_comp")
     def snapshot_comp() -> dict:
@@ -73,6 +96,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("diff_comp")
     def diff_comp(snapshot_id: str) -> dict:

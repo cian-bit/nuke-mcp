@@ -22,3 +22,19 @@ def test_get_default_knob(connected):
 def test_set_knob_nonexistent_node(connected):
     with pytest.raises(connection.CommandError):
         connection.send("set_knob", node="nope", knob="mix", value=1)
+
+
+def test_set_knobs_batch(connected):
+    connection.send("create_node", type="Grade", name="g1")
+    connection.send("create_node", type="Blur", name="b1")
+    result = connection.send(
+        "set_knobs",
+        operations=[
+            {"node": "g1", "knob": "mix", "value": 0.5},
+            {"node": "b1", "knob": "size", "value": 10},
+        ],
+    )
+    assert result["count"] == 2
+    # verify values stuck
+    assert connection.send("get_knob", node="g1", knob="mix")["value"] == 0.5
+    assert connection.send("get_knob", node="b1", knob="size")["value"] == 10

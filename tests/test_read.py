@@ -54,3 +54,28 @@ def test_read_selected_empty(connected):
     connection.send("create_node", type="Grade", name="Orphan")
     result = connection.send("read_selected")
     assert result["count"] == 0
+
+
+def test_read_comp_summary_mode(connected):
+    connection.send("create_node", type="Grade", name="g")
+    connection.send("set_knob", node="g", knob="mix", value=0.5)
+    result = connection.send("read_comp", summary=True)
+    g_node = next(n for n in result["nodes"] if n["name"] == "g")
+    assert "knobs" not in g_node
+
+
+def test_read_comp_type_filter(connected):
+    connection.send("create_node", type="Grade", name="g1")
+    connection.send("create_node", type="Blur", name="b1")
+    connection.send("create_node", type="Grade", name="g2")
+    result = connection.send("read_comp", type="Grade")
+    assert result["count"] == 2
+    assert all(n["type"] == "Grade" for n in result["nodes"])
+
+
+def test_read_comp_pagination(connected):
+    for i in range(5):
+        connection.send("create_node", type="Grade", name=f"g{i}")
+    result = connection.send("read_comp", offset=2, limit=2)
+    assert result["count"] == 2
+    assert result["total"] == 5

@@ -10,7 +10,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("create_node")
     def create_node(
         type: str,
@@ -33,6 +33,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"destructiveHint": True},
+        output_schema=None,
     )
     @nuke_command("delete_node")
     def delete_node(name: str, confirm: bool = False) -> dict:
@@ -50,6 +51,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("find_nodes")
     def find_nodes(
@@ -75,6 +77,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("list_nodes")
     def list_nodes(root: str | None = None) -> dict:
@@ -88,7 +91,7 @@ def register(ctx: ServerContext) -> None:
             params["root"] = root
         return connection.send("list_nodes", **params)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("connect_nodes")
     def connect_nodes(
         from_node: str,
@@ -107,7 +110,7 @@ def register(ctx: ServerContext) -> None:
             params["input"] = input_index
         return connection.send("connect_nodes", **params)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("auto_layout")
     def auto_layout(selected_only: bool = False) -> dict:
         """Auto-arrange the node graph layout.
@@ -117,19 +120,48 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("auto_layout", selected_only=selected_only)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("modify_node")
     def modify_node(
         name: str,
         new_name: str | None = None,
+        update_expressions: bool = True,
     ) -> dict:
-        """Rename a node.
+        """Rename a node. Checks for expressions that reference this node
+        and optionally updates them to use the new name.
 
         Args:
             name: current node name.
             new_name: new name to set.
+            update_expressions: auto-fix expressions referencing the old name. default True.
         """
         params: dict = {"name": name}
         if new_name:
             params["new_name"] = new_name
+            params["update_expressions"] = update_expressions
         return connection.send("modify_node", **params)
+
+    @ctx.mcp.tool(output_schema=None)
+    @nuke_command("create_nodes")
+    def create_nodes(nodes: str) -> dict:
+        """Create multiple nodes in one call. Much faster than individual create_node calls.
+
+        Args:
+            nodes: JSON array of node specs. each spec has: type (required), name (optional),
+                   connect_to (optional). example: '[{"type":"Grade"},{"type":"Blur","connect_to":"Grade1"}]'
+        """
+        import json as _json
+
+        parsed = _json.loads(nodes)
+        return connection.send("create_nodes", nodes=parsed)
+
+    @ctx.mcp.tool(output_schema=None)
+    @nuke_command("disconnect_input")
+    def disconnect_node_input(node: str, input_index: int) -> dict:
+        """Disconnect a specific input on a node.
+
+        Args:
+            node: node name.
+            input_index: which input to disconnect (0-based).
+        """
+        return connection.send("disconnect_input", node=node, input=input_index)

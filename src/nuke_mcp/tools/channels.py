@@ -12,6 +12,7 @@ if False:
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("list_channels")
     def list_channels(node: str) -> dict:
@@ -22,7 +23,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("list_channels", node=node)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("shuffle_channels")
     def shuffle_channels(
         input_node: str,
@@ -49,7 +50,7 @@ __result__ = {{"name": s.name(), "from": {from_layer!r}, "to": {to_layer!r}}}
 """
         return connection.send("execute_python", code=code)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("setup_aov_merge")
     def setup_aov_merge(read_nodes: str) -> dict:
         """Merge multiple AOV Read nodes together (additive). Common EXR workflow.

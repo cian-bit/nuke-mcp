@@ -12,6 +12,7 @@ if False:
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
         annotations={"destructiveHint": True},
+        output_schema=None,
     )
     @nuke_command("execute_python")
     def execute_python(code: str, confirm: bool = False) -> dict:

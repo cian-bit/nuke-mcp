@@ -10,7 +10,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("setup_write")
     def setup_write(
         input_node: str,
@@ -43,6 +43,7 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
 
     @ctx.mcp.tool(
         annotations={"destructiveHint": True},
+        output_schema=None,
     )
     @nuke_command("render_frames")
     def render_frames(
@@ -74,7 +75,7 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
             params["frame_range"] = [first_frame, last_frame]
         return connection.send_raw("render", timeout=300.0, **params)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("setup_precomp")
     def setup_precomp(
         source_node: str,
@@ -155,6 +156,7 @@ __result__ = {{
 
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("list_precomps")
     def list_precomps() -> dict:

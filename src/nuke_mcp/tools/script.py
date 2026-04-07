@@ -12,13 +12,14 @@ if False:
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
         annotations={"readOnlyHint": True},
+        output_schema=None,
     )
     @nuke_command("get_script_info")
     def get_script_info() -> dict:
         """Get current script metadata: path, frame range, fps, format, colorspace, node count."""
         return connection.send("get_script_info")
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("save_script")
     def save_script(path: str | None = None) -> dict:
         """Save the script. If path is given, saves as a new file.
@@ -33,6 +34,7 @@ def register(ctx: ServerContext) -> None:
 
     @ctx.mcp.tool(
         annotations={"destructiveHint": True},
+        output_schema=None,
     )
     @nuke_command("load_script")
     def load_script(path: str, confirm: bool = False) -> dict:
@@ -48,7 +50,7 @@ def register(ctx: ServerContext) -> None:
             }
         return connection.send("load_script", path=path)
 
-    @ctx.mcp.tool()
+    @ctx.mcp.tool(output_schema=None)
     @nuke_command("set_frame_range")
     def set_frame_range(
         first: int | None = None,

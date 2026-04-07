@@ -76,3 +76,33 @@ def test_auto_layout(connected):
     connection.send("create_node", type="Grade", name="g")
     result = connection.send("auto_layout")
     assert result["laid_out"] == 2
+
+
+def test_create_nodes_batch(connected):
+    result = connection.send(
+        "create_nodes",
+        nodes=[
+            {"type": "Read", "name": "plate"},
+            {"type": "Grade", "name": "cc", "connect_to": "plate"},
+            {"type": "Blur", "name": "defocus"},
+        ],
+    )
+    assert result["count"] == 3
+    names = [n["name"] for n in result["nodes"]]
+    assert "plate" in names
+    assert "cc" in names
+    assert "defocus" in names
+
+
+def test_disconnect_input(connected):
+    connection.send("create_node", type="Read", name="src")
+    connection.send("create_node", type="Grade", name="dst")
+    connection.send("connect_nodes", **{"from": "src", "to": "dst"})
+    result = connection.send("disconnect_input", node="dst", input=0)
+    assert result["disconnected"]
+
+
+def test_modify_node_rename(connected):
+    connection.send("create_node", type="Grade", name="old_name")
+    result = connection.send("modify_node", name="old_name", new_name="new_name")
+    assert result["name"] == "new_name"

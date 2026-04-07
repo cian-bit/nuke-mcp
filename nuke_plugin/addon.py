@@ -161,8 +161,21 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def _json_safe(obj: Any) -> Any:
+    """Make any Python value JSON-serializable."""
+    if obj is None or isinstance(obj, bool | int | float | str):
+        return obj
+    if isinstance(obj, tuple):
+        return list(obj)
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    return str(obj)
+
+
 def _send(sock: socket.socket, data: dict) -> None:
-    payload = json.dumps(data, separators=(",", ":"), default=str).encode("utf-8")
+    payload = json.dumps(_json_safe(data), separators=(",", ":")).encode("utf-8")
     sock.sendall(payload + b"\n")
 
 
@@ -260,6 +273,11 @@ def _handle_create_node(params: dict) -> dict:
     connect_to = params.get("connect_to")
     knobs_to_set = params.get("knobs", {})
 
+    # deselect all to prevent auto-connection to "current" node
+    if not connect_to:
+        for n in nuke.selectedNodes():
+            n.setSelected(False)
+
     node = nuke.createNode(node_type, inpanel=False)
     if name:
         node.setName(name)
@@ -305,6 +323,7 @@ def _handle_modify_node(params: dict) -> dict:
     knobs = params.get("knobs", {})
     position = params.get("position")
     new_name = params.get("new_name")
+    update_expressions = params.get("update_expressions", False)
 
     for k, v in knobs.items():
         knob = node.knob(k)
@@ -313,10 +332,30 @@ def _handle_modify_node(params: dict) -> dict:
 
     if position:
         node.setXYpos(int(position[0]), int(position[1]))
+
+    broken_expressions: list[str] = []
     if new_name:
+        # scan for expression references before renaming
+        old_name = name
+        for n in nuke.allNodes():
+            for k in n.knobs():
+                knob = n.knob(k)
+                if knob.hasExpression():
+                    expr = knob.expression()
+                    if old_name in expr:
+                        broken_expressions.append(f"{n.name()}.{k}")
+                        if update_expressions:
+                            knob.setExpression(expr.replace(old_name, new_name))
+
         node.setName(new_name)
 
-    return {"name": node.name(), "type": node.Class()}
+    result: dict[str, Any] = {"name": node.name(), "type": node.Class()}
+    if broken_expressions:
+        if update_expressions:
+            result["updated_expressions"] = broken_expressions
+        else:
+            result["broken_expressions"] = broken_expressions
+    return result
 
 
 def _handle_connect_nodes(params: dict) -> dict:
@@ -421,7 +460,26 @@ def _handle_set_knob(params: dict) -> dict:
     if knob is None:
         raise ValueError(f"knob not found: {params['knob']} on {params['node']}")
 
-    knob.setValue(params["value"])
+    value = params["value"]
+
+    # handle multi-value knobs: if a scalar is passed to a knob that expects
+    # multiple values (e.g. size [x,y], color [r,g,b,a]), expand it
+    if isinstance(value, int | float):
+        knob_class = type(knob).__name__
+        if knob_class in ("XY_Knob", "WH_Knob"):
+            value = [float(value), float(value)]
+        elif knob_class == "XYZ_Knob":
+            value = [float(value), float(value), float(value)]
+        elif knob_class == "AColor_Knob":
+            value = [float(value)] * 4
+
+    # handle list/array values for multi-value knobs
+    if isinstance(value, list):
+        for i, v in enumerate(value):
+            knob.setValue(float(v), i)
+    else:
+        knob.setValue(value)
+
     return {"node": node.name(), "knob": params["knob"], "value": knob.value()}
 
 
@@ -444,6 +502,10 @@ def _handle_read_comp(params: dict) -> dict:
 
     root_name = params.get("root")
     depth = params.get("depth", 999)
+    summary = params.get("summary", False)
+    node_type = params.get("type")
+    offset = params.get("offset", 0)
+    limit = params.get("limit", 0)  # 0 = no limit
 
     if root_name:
         root_node = nuke.toNode(root_name)
@@ -453,9 +515,21 @@ def _handle_read_comp(params: dict) -> dict:
     else:
         nodes = nuke.allNodes()
 
+    # filter by type if requested
+    if node_type:
+        nodes = [n for n in nodes if n.Class() == node_type]
+
+    total = len(nodes)
+
+    # paginate
+    if offset:
+        nodes = nodes[offset:]
+    if limit:
+        nodes = nodes[:limit]
+
     result = []
     for n in nodes:
-        entry = {
+        entry: dict[str, Any] = {
             "name": n.name(),
             "type": n.Class(),
         }
@@ -468,48 +542,52 @@ def _handle_read_comp(params: dict) -> dict:
         if any(inputs):
             entry["inputs"] = inputs
 
-        changed: dict[str, Any] = {}
-        for k in n.knobs():
-            if k in _SKIP_KNOBS:
-                continue
-            knob = n.knob(k)
-            if (
-                knob.isAnimated()
-                or knob.hasExpression()
-                or (hasattr(knob, "isDefault") and not knob.isDefault())
-            ):
-                try:
-                    val = knob.value()
-                    if isinstance(val, str) and len(val) > 500:
-                        changed[k] = f"<{len(val)} chars>"
-                    elif isinstance(val, int | float | str | bool | list):
-                        changed[k] = val
-                except Exception:
-                    pass
-        if changed:
-            entry["knobs"] = changed
-
         if n.hasError():
             entry["error"] = True
 
-        # expressions
-        exprs = {}
-        for k in n.knobs():
-            knob = n.knob(k)
-            if knob.hasExpression():
-                exprs[k] = knob.expression()
-        if exprs:
-            entry["expressions"] = exprs
+        # summary mode: skip knobs and expressions to save tokens
+        if not summary:
+            changed: dict[str, Any] = {}
+            for k in n.knobs():
+                if k in _SKIP_KNOBS:
+                    continue
+                knob = n.knob(k)
+                if (
+                    knob.isAnimated()
+                    or knob.hasExpression()
+                    or (hasattr(knob, "isDefault") and not knob.isDefault())
+                ):
+                    with contextlib.suppress(Exception):
+                        val = knob.value()
+                        if isinstance(val, str) and len(val) > 500:
+                            changed[k] = f"<{len(val)} chars>"
+                        elif isinstance(val, int | float | str | bool | list | tuple):
+                            changed[k] = val
+            if changed:
+                entry["knobs"] = changed
 
-        # group internals (one level only to save tokens)
-        if hasattr(n, "nodes") and depth > 0:
-            children = n.nodes()
-            if children:
-                entry["children"] = [{"name": c.name(), "type": c.Class()} for c in children]
+            # expressions
+            exprs = {}
+            for k in n.knobs():
+                knob = n.knob(k)
+                if knob.hasExpression():
+                    exprs[k] = knob.expression()
+            if exprs:
+                entry["expressions"] = exprs
+
+            # group internals (one level only to save tokens)
+            if hasattr(n, "nodes") and depth > 0:
+                children = n.nodes()
+                if children:
+                    entry["children"] = [{"name": c.name(), "type": c.Class()} for c in children]
 
         result.append(entry)
 
-    return {"nodes": result, "count": len(result)}
+    resp: dict[str, Any] = {"nodes": result, "count": len(result), "total": total}
+    if offset or limit:
+        resp["offset"] = offset
+        resp["limit"] = limit
+    return resp
 
 
 def _handle_read_selected(params: dict) -> dict:
@@ -581,7 +659,11 @@ def _handle_execute_python(params: dict) -> dict:
     result: dict[str, Any] = {}
     exec_globals: dict[str, Any] = {"nuke": nuke, "__result__": result}
     exec(code, exec_globals)
-    return exec_globals.get("__result__", {})
+    out = exec_globals.get("__result__", {})
+    # always return a dict -- wrap primitives
+    if not isinstance(out, dict):
+        return {"result": out}
+    return out
 
 
 def _handle_render(params: dict) -> dict:
@@ -808,6 +890,72 @@ def _handle_list_channels(params: dict) -> dict:
     return {"layers": layers}
 
 
+def _handle_create_nodes(params: dict) -> dict:
+    """Batch create multiple nodes in one call."""
+    import nuke
+
+    specs = params.get("nodes", [])
+    created = []
+    for spec in specs:
+        # deselect all to prevent auto-connection
+        for n in nuke.selectedNodes():
+            n.setSelected(False)
+
+        node = nuke.createNode(spec["type"], inpanel=False)
+        if spec.get("name"):
+            node.setName(spec["name"])
+        if spec.get("connect_to"):
+            src = nuke.toNode(spec["connect_to"])
+            if src:
+                node.setInput(0, src)
+        for k, v in spec.get("knobs", {}).items():
+            knob = node.knob(k)
+            if knob:
+                knob.setValue(v)
+        created.append({"name": node.name(), "type": node.Class()})
+    return {"created": created, "count": len(created)}
+
+
+def _handle_set_knobs(params: dict) -> dict:
+    """Batch set multiple knobs across one or more nodes."""
+    import nuke
+
+    ops = params.get("operations", [])
+    results = []
+    for op in ops:
+        node = nuke.toNode(op["node"])
+        if node is None:
+            results.append({"node": op["node"], "error": "not found"})
+            continue
+        knob = node.knob(op["knob"])
+        if knob is None:
+            results.append({"node": op["node"], "knob": op["knob"], "error": "knob not found"})
+            continue
+        value = op["value"]
+        if isinstance(value, list):
+            for i, v in enumerate(value):
+                knob.setValue(float(v), i)
+        else:
+            knob.setValue(value)
+        results.append({"node": node.name(), "knob": op["knob"], "value": knob.value()})
+    return {"results": results, "count": len(results)}
+
+
+def _handle_disconnect_input(params: dict) -> dict:
+    """Disconnect a specific input on a node."""
+    import nuke
+
+    name = params["node"]
+    node = nuke.toNode(name)
+    if node is None:
+        raise ValueError(f"node not found: {name}")
+    input_idx = params.get("input", 0)
+    old_input = node.input(input_idx)
+    old_name = old_input.name() if old_input else None
+    node.setInput(input_idx, None)
+    return {"node": name, "input": input_idx, "disconnected": old_name}
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -836,4 +984,7 @@ HANDLERS: dict[str, Any] = {
     "list_keyframes": _handle_list_keyframes,
     "snapshot_comp": _handle_snapshot_comp,
     "diff_comp": _handle_diff_comp,
+    "create_nodes": _handle_create_nodes,
+    "set_knobs": _handle_set_knobs,
+    "disconnect_input": _handle_disconnect_input,
 }

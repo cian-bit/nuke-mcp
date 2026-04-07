@@ -118,6 +118,9 @@ class MockNukeServer:
             "list_keyframes": self._list_keyframes,
             "snapshot_comp": self._snapshot_comp,
             "diff_comp": self._diff_comp,
+            "create_nodes": self._create_nodes,
+            "set_knobs": self._set_knobs,
+            "disconnect_input": self._disconnect_input,
         }.get(cmd)
 
         if handler is None:
@@ -247,17 +250,29 @@ class MockNukeServer:
         return {"laid_out": len(self.nodes)}
 
     def _read_comp(self, p: dict) -> dict:
-        nodes = []
+        all_nodes = []
+        type_filter = p.get("type")
+        summary = p.get("summary", False)
         for name, data in self.nodes.items():
+            if type_filter and data["type"] != type_filter:
+                continue
             entry: dict[str, Any] = {"name": name, "type": data["type"]}
             conns = self.connections.get(name, [])
             if any(conns):
                 entry["inputs"] = conns
-            knobs = data.get("knobs", {})
-            if knobs:
-                entry["knobs"] = knobs
-            nodes.append(entry)
-        return {"nodes": nodes, "count": len(nodes)}
+            if not summary:
+                knobs = data.get("knobs", {})
+                if knobs:
+                    entry["knobs"] = knobs
+            all_nodes.append(entry)
+        total = len(all_nodes)
+        offset = p.get("offset", 0)
+        limit = p.get("limit", 0)
+        if offset:
+            all_nodes = all_nodes[offset:]
+        if limit:
+            all_nodes = all_nodes[:limit]
+        return {"nodes": all_nodes, "count": len(all_nodes), "total": total}
 
     def _read_selected(self, p: dict) -> dict:
         if not self.selected:
@@ -373,6 +388,28 @@ class MockNukeServer:
         if name not in self.nodes:
             raise ValueError(f"node not found: {name}")
         return {"layers": {"rgba": ["red", "green", "blue", "alpha"]}}
+
+    def _create_nodes(self, p: dict) -> dict:
+        results = []
+        for spec in p["nodes"]:
+            results.append(self._create_node(spec))
+        return {"nodes": results, "count": len(results)}
+
+    def _set_knobs(self, p: dict) -> dict:
+        results = []
+        for op in p["operations"]:
+            results.append(self._set_knob(op))
+        return {"results": results, "count": len(results)}
+
+    def _disconnect_input(self, p: dict) -> dict:
+        node = p["node"]
+        idx = p["input"]
+        if node not in self.nodes:
+            raise ValueError(f"node not found: {node}")
+        conns = self.connections.get(node, [])
+        if idx < len(conns):
+            conns[idx] = None
+        return {"node": node, "input": idx, "disconnected": True}
 
 
 @pytest.fixture
