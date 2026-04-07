@@ -8,7 +8,19 @@ import os
 from fastmcp import FastMCP
 
 from nuke_mcp import connection
-from nuke_mcp.tools import channels, code, comp, graph, knobs, read, render, script, viewer
+from nuke_mcp.tools import (
+    channels,
+    code,
+    comp,
+    expressions,
+    graph,
+    knobs,
+    read,
+    render,
+    roto,
+    script,
+    viewer,
+)
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +53,8 @@ def build_server(mock: bool = False) -> FastMCP:
     viewer.register(ctx)
     code.register(ctx)
     comp.register(ctx)
+    expressions.register(ctx)
+    roto.register(ctx)
 
     return mcp
 

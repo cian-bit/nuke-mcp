@@ -30,7 +30,7 @@ def register(ctx: ServerContext) -> None:
             root: read children of this node only (e.g. a Group name). omit for entire script.
             depth: how many levels deep to recurse into groups. default 999.
         """
-        params = {"depth": depth}
+        params: dict[str, str | int] = {"depth": depth}
         if root:
             params["root"] = root
         return connection.send("read_comp", **params)
@@ -58,3 +58,28 @@ def register(ctx: ServerContext) -> None:
         Use when the user says 'look at this' or 'what do you think of this section'.
         """
         return connection.send("read_selected")
+
+    @ctx.mcp.tool(
+        annotations={"readOnlyHint": True},
+    )
+    @nuke_command("snapshot_comp")
+    def snapshot_comp() -> dict:
+        """Take a snapshot of the current comp state. Returns a snapshot_id
+        you can pass to diff_comp later to see what changed.
+
+        Snapshots are stored server-side (max 5). Use before making changes.
+        """
+        return connection.send("snapshot_comp")
+
+    @ctx.mcp.tool(
+        annotations={"readOnlyHint": True},
+    )
+    @nuke_command("diff_comp")
+    def diff_comp(snapshot_id: str) -> dict:
+        """Compare the current comp to a previous snapshot. Shows nodes
+        added, removed, and knobs changed. Call snapshot_comp first.
+
+        Args:
+            snapshot_id: ID from a previous snapshot_comp call.
+        """
+        return connection.send("diff_comp", snapshot_id=snapshot_id)
