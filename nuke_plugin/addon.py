@@ -83,23 +83,33 @@ def _server_loop(port: int) -> None:
         stop()
 
 
-def _handle_client(client: socket.socket) -> None:
+def _build_handshake() -> dict:
     import nuke
 
-    # send handshake
-    version = nuke.NUKE_VERSION_STRING
     variant = "Nuke"
-    if nuke.env.get("NukeVersionString", "").startswith("NukeX"):
-        variant = "NukeX"
-    elif nuke.env.get("studio", False):
+    if nuke.env.get("studio"):
         variant = "NukeStudio"
+    elif nuke.env.get("nukex"):
+        variant = "NukeX"
 
-    handshake = {
-        "nuke_version": version,
+    return {
+        "nuke_version": nuke.NUKE_VERSION_STRING,
         "variant": variant,
         "pid": os.getpid(),
     }
-    _send(client, handshake)
+
+
+def _handle_client(client: socket.socket) -> None:
+    import nuke
+
+    # handshake must run on main thread
+    try:
+        handshake = nuke.executeInMainThreadWithResult(_build_handshake)
+        _send(client, handshake)
+    except Exception:
+        log.error("handshake failed:\n%s", traceback.format_exc())
+        client.close()
+        return
 
     buf = b""
     while _running:
@@ -171,7 +181,7 @@ def _handle_get_script_info(params: dict) -> dict:
         "first_frame": int(root["first_frame"].value()),
         "last_frame": int(root["last_frame"].value()),
         "fps": root["fps"].value(),
-        "format": str(root.format()),
+        "format": root.format().name(),
         "colorspace": root["colorManagement"].value() if root.knob("colorManagement") else "",
         "node_count": len(nuke.allNodes()),
     }
@@ -194,7 +204,7 @@ def _handle_get_node_info(params: dict) -> dict:
     knobs = {}
     for k in node.knobs():
         knob = node.knob(k)
-        if knob.isAnimated() or knob.hasExpression() or not knob.isDefault():
+        if knob.isAnimated() or knob.hasExpression() or (hasattr(knob, "isDefault") and not knob.isDefault()):
             try:
                 knobs[k] = knob.value()
             except Exception:
@@ -361,7 +371,7 @@ def _handle_get_knob(params: dict) -> dict:
         "value": knob.value(),
         "type": type(knob).__name__,
         "animated": knob.isAnimated(),
-        "default": knob.isDefault(),
+        "default": knob.isDefault() if hasattr(knob, "isDefault") else False,
     }
     if knob.hasExpression():
         result["expression"] = knob.expression()
@@ -434,7 +444,7 @@ def _handle_read_comp(params: dict) -> dict:
         changed = {}
         for k in n.knobs():
             knob = n.knob(k)
-            if knob.isAnimated() or knob.hasExpression() or not knob.isDefault():
+            if knob.isAnimated() or knob.hasExpression() or (hasattr(knob, "isDefault") and not knob.isDefault()):
                 try:
                     val = knob.value()
                     # skip UI-only knobs and massive data
