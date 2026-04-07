@@ -39,10 +39,13 @@ def build_server(mock: bool = False) -> FastMCP:
         ),
     )
 
-    version = connection.connect(NUKE_HOST, NUKE_PORT) if not mock else None
+    # defer connection to first tool call -- Nuke might not be running yet
+    # the auto-reconnect in connection.send() handles lazy connect
+    if not mock:
+        connection._last_host = NUKE_HOST
+        connection._last_port = NUKE_PORT
 
-    # register tool modules
-    ctx = ServerContext(mcp=mcp, version=version, mock=mock)
+    ctx = ServerContext(mcp=mcp, version=None, mock=mock)
 
     read.register(ctx)
     graph.register(ctx)
