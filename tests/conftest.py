@@ -1,4 +1,13 @@
-"""Mock Nuke server for testing without a running Nuke instance."""
+"""Mock Nuke server + node graph for testing without a running Nuke instance.
+
+The ``MockNukeServer`` mocks the addon wire protocol; ``MockNukeNode`` and
+``MockNukeScript`` mock the in-process ``nuke`` Python API so tools that ship
+``execute_python`` payloads can be exercised against an in-memory graph.
+
+A4 brought ``MockNukeNode`` (ported from MockHouNode in
+``houdini-mcp-beta/tests/conftest.py``) plus 30+ first-class node-type
+factories. Tests opt into the registry via the ``mock_script`` fixture.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +18,747 @@ import time
 from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# MockNukeNode + supporting knob types
+# ---------------------------------------------------------------------------
+
+
+class MockKnob:
+    """Mock Nuke knob. Default scalar knob with value/expression/animation."""
+
+    _knob_class = "Double_Knob"
+    _dimensions = 1
+
+    def __init__(self, name: str, value: Any = 0.0, default: Any | None = None) -> None:
+        self._name = name
+        self._value = value
+        self._default = default if default is not None else value
+        self._expression: str | None = None
+        self._keys: list[tuple[float, Any]] = []
+        self._animated = False
+
+    # -- basics --
+
+    def name(self) -> str:
+        return self._name
+
+    def Class(self) -> str:  # noqa: N802 - Nuke API casing
+        return self._knob_class
+
+    def value(self) -> Any:
+        return self._value
+
+    def setValue(self, v: Any) -> bool:  # noqa: N802 - Nuke API casing
+        self._value = v
+        return True
+
+    def getValue(self) -> Any:  # noqa: N802 - Nuke API casing
+        return self._value
+
+    def evaluate(self) -> Any:
+        # default scalar evaluate returns the current value
+        return self._value
+
+    # -- expressions --
+
+    def setExpression(self, expr: str, channel: int = 0) -> bool:  # noqa: N802
+        self._expression = expr
+        return True
+
+    def clearAnimated(self, channel: int = -1) -> bool:  # noqa: N802
+        self._animated = False
+        self._keys = []
+        return True
+
+    def hasExpression(self) -> bool:  # noqa: N802
+        return self._expression is not None
+
+    def expression(self) -> str | None:
+        return self._expression
+
+    # -- animation / keys --
+
+    def isAnimated(self, channel: int = 0) -> bool:  # noqa: N802
+        return self._animated
+
+    def setAnimated(self) -> None:  # noqa: N802
+        self._animated = True
+
+    def isKey(self, time: float | None = None) -> bool:  # noqa: N802
+        if time is None:
+            return self._animated
+        return any(abs(k[0] - time) < 1e-6 for k in self._keys)
+
+    def setKey(self, time: float, value: Any) -> None:  # noqa: N802
+        self._animated = True
+        self._keys = [k for k in self._keys if abs(k[0] - time) > 1e-6]
+        self._keys.append((time, value))
+        self._keys.sort(key=lambda k: k[0])
+
+    def numKeys(self) -> int:  # noqa: N802
+        return len(self._keys)
+
+    def getKeyTime(self, index: int) -> float:  # noqa: N802
+        return self._keys[index][0]
+
+    def getKeyValue(self, index: int) -> Any:  # noqa: N802
+        return self._keys[index][1]
+
+    # -- defaults --
+
+    def isDefault(self) -> bool:  # noqa: N802
+        return self._value == self._default and not self._animated and self._expression is None
+
+    def defaultValue(self) -> Any:  # noqa: N802
+        return self._default
+
+    def dimensions(self) -> int:
+        return self._dimensions
+
+
+class MockFileKnob(MockKnob):
+    """File_Knob -- evaluate() expands TCL/python like ``[python ...]``."""
+
+    _knob_class = "File_Knob"
+
+    def evaluate(self) -> Any:
+        # in real Nuke evaluate() expands TCL; for the mock we return the value
+        return self._value
+
+
+class MockFormatKnob(MockKnob):
+    """Format_Knob -- value is a string label."""
+
+    _knob_class = "Format_Knob"
+
+    def __init__(self, name: str, value: str = "HD 1920x1080") -> None:
+        super().__init__(name, value)
+
+
+class MockArrayKnob(MockKnob):
+    """N-dim array knob (XY_Knob, XYZ_Knob, Color_Knob)."""
+
+    def __init__(
+        self,
+        name: str,
+        value: list[float] | tuple[float, ...] | None = None,
+        dims: int = 2,
+        knob_class: str = "XY_Knob",
+    ) -> None:
+        v = list(value) if value is not None else [0.0] * dims
+        super().__init__(name, v, default=list(v))
+        self._dimensions = dims
+        self._knob_class = knob_class
+
+    def setValue(self, v: Any, channel: int | None = None) -> bool:  # noqa: N802
+        if channel is not None and isinstance(self._value, list):
+            self._value[channel] = v
+        else:
+            self._value = list(v) if isinstance(v, list | tuple) else v
+        return True
+
+
+class MockBoolKnob(MockKnob):
+    _knob_class = "Boolean_Knob"
+
+
+class MockChannelKnob(MockKnob):
+    _knob_class = "Channel_Knob"
+
+
+class MockEnumKnob(MockKnob):
+    _knob_class = "Enumeration_Knob"
+
+    def __init__(self, name: str, value: str = "", values: list[str] | None = None) -> None:
+        super().__init__(name, value)
+        self._values = values or []
+
+    def values(self) -> list[str]:
+        return list(self._values)
+
+
+class MockNukeNode:
+    """Mock Nuke node. Mirrors the surface of the real ``nuke.Node`` enough
+    to drive comp/render/channel tools through ``execute_python`` payloads.
+
+    Construct directly for custom shapes, or use one of the type factories
+    (``MockNukeNode.read``, ``.write``, etc.) for sensible defaults.
+    """
+
+    def __init__(
+        self,
+        name: str = "Node1",
+        node_class: str = "NoOp",
+        knobs: dict[str, MockKnob] | None = None,
+        xpos: int = 0,
+        ypos: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._name = name
+        self._class = node_class
+        self._knobs: dict[str, MockKnob] = knobs if knobs is not None else {}
+        self._xpos = xpos
+        self._ypos = ypos
+        self._metadata: dict[str, Any] = metadata or {}
+        self._inputs: list[MockNukeNode | None] = []
+        self._dependents: list[MockNukeNode] = []
+        self._selected = False
+        self._disabled = False
+        self._error = False
+        self._warning = False
+
+        # ensure baseline knobs every Nuke node carries
+        self._knobs.setdefault("name", MockKnob("name", value=name))
+        self._knobs.setdefault("xpos", MockKnob("xpos", value=xpos))
+        self._knobs.setdefault("ypos", MockKnob("ypos", value=ypos))
+        self._knobs.setdefault("disable", MockBoolKnob("disable", value=False))
+        self._knobs.setdefault("label", MockKnob("label", value=""))
+
+    # -- identity --
+
+    def name(self) -> str:
+        return self._name
+
+    def setName(self, name: str) -> None:  # noqa: N802
+        self._name = name
+        if "name" in self._knobs:
+            self._knobs["name"].setValue(name)
+
+    def Class(self) -> str:  # noqa: N802 - Nuke API casing
+        return self._class
+
+    def fullName(self) -> str:  # noqa: N802
+        return self._name
+
+    # -- position --
+
+    def xpos(self) -> int:
+        return self._xpos
+
+    def ypos(self) -> int:
+        return self._ypos
+
+    def setXYpos(self, x: int, y: int) -> None:  # noqa: N802
+        self._xpos = int(x)
+        self._ypos = int(y)
+        if "xpos" in self._knobs:
+            self._knobs["xpos"].setValue(int(x))
+        if "ypos" in self._knobs:
+            self._knobs["ypos"].setValue(int(y))
+
+    # -- inputs / outputs --
+
+    def inputs(self) -> int:
+        # Nuke's inputs() returns the count of valid input slots
+        return len(self._inputs)
+
+    def maximumInputs(self) -> int:  # noqa: N802
+        return max(2, len(self._inputs))
+
+    def minimumInputs(self) -> int:  # noqa: N802
+        return 0
+
+    def input(self, idx: int) -> MockNukeNode | None:
+        if idx < 0 or idx >= len(self._inputs):
+            return None
+        return self._inputs[idx]
+
+    def setInput(self, idx: int, node: MockNukeNode | None) -> bool:  # noqa: N802
+        while len(self._inputs) <= idx:
+            self._inputs.append(None)
+        old = self._inputs[idx]
+        if old is not None and self in old._dependents:
+            old._dependents.remove(self)
+        self._inputs[idx] = node
+        if node is not None and self not in node._dependents:
+            node._dependents.append(self)
+        return True
+
+    def dependent(self, what: int = 0, forceEvaluate: bool = True) -> list[MockNukeNode]:  # noqa: N803
+        return list(self._dependents)
+
+    def dependencies(self, what: int = 0) -> list[MockNukeNode]:
+        return [n for n in self._inputs if n is not None]
+
+    # -- knobs --
+
+    def knob(self, name: str) -> MockKnob | None:
+        return self._knobs.get(name)
+
+    def knobs(self) -> dict[str, MockKnob]:
+        return dict(self._knobs)
+
+    def addKnob(self, knob: MockKnob) -> None:  # noqa: N802
+        self._knobs[knob.name()] = knob
+
+    def __getitem__(self, name: str) -> MockKnob:
+        if name not in self._knobs:
+            # mimic Nuke -- create on demand for unknown knobs (Nuke is permissive)
+            self._knobs[name] = MockKnob(name, value="")
+        return self._knobs[name]
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._knobs
+
+    # -- metadata --
+
+    def metadata(self, key: str | None = None) -> Any:
+        if key is None:
+            return dict(self._metadata)
+        return self._metadata.get(key)
+
+    def setMetadata(self, key: str, value: Any) -> None:  # noqa: N802
+        self._metadata[key] = value
+
+    # -- flags / state --
+
+    def selected(self) -> bool:
+        return self._selected
+
+    def setSelected(self, value: bool) -> None:  # noqa: N802
+        self._selected = bool(value)
+
+    def isDisabled(self) -> bool:  # noqa: N802
+        return self._disabled
+
+    def setDisabled(self, value: bool) -> None:  # noqa: N802
+        self._disabled = bool(value)
+
+    def hasError(self) -> bool:  # noqa: N802
+        return self._error
+
+    def error(self) -> bool:
+        return self._error
+
+    def warning(self) -> bool:
+        return self._warning
+
+    # -- serialise (used by snapshots / digests) --
+
+    def to_dict(self) -> dict[str, Any]:
+        knobs_out: dict[str, Any] = {}
+        for k_name, k in self._knobs.items():
+            if k_name in ("name", "xpos", "ypos"):
+                continue
+            if not k.isDefault():
+                knobs_out[k_name] = k.value()
+        return {
+            "name": self._name,
+            "type": self._class,
+            "x": self._xpos,
+            "y": self._ypos,
+            "knobs": knobs_out,
+            "inputs": [n.name() if n else None for n in self._inputs],
+        }
+
+    # ------------------------------------------------------------------
+    # First-class node-type factories
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def read(
+        cls, name: str = "Read1", file: str = "", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "file": MockFileKnob("file", value=file),
+            "first": MockKnob("first", value=1001),
+            "last": MockKnob("last", value=1100),
+            "format": MockFormatKnob("format", value="HD 1920x1080"),
+            "colorspace": MockKnob("colorspace", value="default"),
+            "channels": MockChannelKnob("channels", value="rgba"),
+            "missing_frames": MockKnob("missing_frames", value="error"),
+        }
+        return cls(name=name, node_class="Read", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def write(
+        cls,
+        name: str = "Write1",
+        file: str = "",
+        file_type: str = "exr",
+        xpos: int = 0,
+        ypos: int = 0,
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "file": MockFileKnob("file", value=file),
+            "file_type": MockEnumKnob(
+                "file_type", value=file_type, values=["exr", "png", "jpg", "dpx"]
+            ),
+            "first": MockKnob("first", value=1001),
+            "last": MockKnob("last", value=1100),
+            "channels": MockChannelKnob("channels", value="rgba"),
+            "colorspace": MockKnob("colorspace", value="scene_linear"),
+            "create_directories": MockBoolKnob("create_directories", value=True),
+        }
+        return cls(name=name, node_class="Write", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def merge2(
+        cls, name: str = "Merge1", operation: str = "over", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "operation": MockEnumKnob(
+                "operation", value=operation, values=["over", "plus", "multiply", "screen"]
+            ),
+            "mix": MockKnob("mix", value=1.0),
+            "bbox": MockEnumKnob("bbox", value="union"),
+        }
+        node = cls(name=name, node_class="Merge2", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def blur(
+        cls, name: str = "Blur1", size: float = 1.0, xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "size": MockKnob("size", value=size),
+            "channels": MockChannelKnob("channels", value="rgba"),
+            "filter": MockEnumKnob("filter", value="gaussian"),
+        }
+        return cls(name=name, node_class="Blur", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def roto(cls, name: str = "Roto1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "curves": MockKnob("curves", value=""),
+            "output": MockEnumKnob("output", value="alpha"),
+        }
+        return cls(name=name, node_class="Roto", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def rotopaint(cls, name: str = "RotoPaint1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "curves": MockKnob("curves", value=""),
+            "output": MockEnumKnob("output", value="rgba"),
+        }
+        return cls(name=name, node_class="RotoPaint", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def tracker4(
+        cls, name: str = "Tracker1", num_tracks: int = 4, xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "transform": MockEnumKnob("transform", value="match-move"),
+            "reference_frame": MockKnob("reference_frame", value=1001),
+        }
+        for i in range(1, num_tracks + 1):
+            knobs[f"track{i}"] = MockArrayKnob(f"track{i}", value=[0.0, 0.0])
+        return cls(name=name, node_class="Tracker4", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def cameratracker(
+        cls, name: str = "CameraTracker1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "numberFeatures": MockKnob("numberFeatures", value=300),
+            "solveMethod": MockEnumKnob("solveMethod", value="auto"),
+            "rangeFirst": MockKnob("rangeFirst", value=1001),
+            "rangeLast": MockKnob("rangeLast", value=1100),
+        }
+        return cls(name=name, node_class="CameraTracker", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def planartracker(
+        cls, name: str = "PlanarTracker1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "referenceFrame": MockKnob("referenceFrame", value=1001),
+            "rootWarp": MockEnumKnob("rootWarp", value="perspective"),
+        }
+        return cls(name=name, node_class="PlanarTrackerNode", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def shuffle(cls, name: str = "Shuffle1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "in1": MockChannelKnob("in1", value="rgba"),
+            "out1": MockChannelKnob("out1", value="rgba"),
+        }
+        return cls(name=name, node_class="Shuffle2", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def scanlinerender(
+        cls, name: str = "ScanlineRender1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "samples": MockKnob("samples", value=1),
+            "MB_samples": MockKnob("MB_samples", value=1),
+            "projection_mode": MockEnumKnob("projection_mode", value="render camera"),
+        }
+        node = cls(name=name, node_class="ScanlineRender", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None, None]
+        return node
+
+    @classmethod
+    def deeprecolor(cls, name: str = "DeepRecolor1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "target_input_alpha": MockBoolKnob("target_input_alpha", value=True),
+        }
+        node = cls(name=name, node_class="DeepRecolor", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def deepmerge(
+        cls, name: str = "DeepMerge1", op: str = "over", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "operation": MockEnumKnob("operation", value=op, values=["over", "holdout", "combine"]),
+        }
+        node = cls(name=name, node_class="DeepMerge", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def deepholdout(cls, name: str = "DeepHoldout1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {}
+        node = cls(name=name, node_class="DeepHoldout", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def deeptransform(
+        cls, name: str = "DeepTransform1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "translate": MockArrayKnob(
+                "translate", value=[0.0, 0.0, 0.0], dims=3, knob_class="XYZ_Knob"
+            ),
+        }
+        return cls(name=name, node_class="DeepTransform", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def copycat(cls, name: str = "CopyCat1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "modelFile": MockFileKnob("modelFile", value=""),
+            "epochs": MockKnob("epochs", value=10000),
+            "inLayer": MockChannelKnob("inLayer", value="rgb"),
+            "outLayer": MockChannelKnob("outLayer", value="rgb"),
+        }
+        return cls(name=name, node_class="CopyCat", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def stmap(cls, name: str = "STMap1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "channels": MockChannelKnob("channels", value="rgba"),
+            "uv": MockChannelKnob("uv", value="forward"),
+        }
+        node = cls(name=name, node_class="STMap", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def idistort(cls, name: str = "IDistort1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "uv": MockChannelKnob("uv", value="forward"),
+        }
+        node = cls(name=name, node_class="IDistort", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def smartvector(cls, name: str = "SmartVector1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "frame": MockKnob("frame", value=1001),
+            "rangeFirst": MockKnob("rangeFirst", value=1001),
+            "rangeLast": MockKnob("rangeLast", value=1100),
+        }
+        return cls(name=name, node_class="SmartVector", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def vectordistort(
+        cls, name: str = "VectorDistort1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "uv": MockChannelKnob("uv", value="motion"),
+            "referenceFrame": MockKnob("referenceFrame", value=1001),
+        }
+        return cls(name=name, node_class="VectorDistort", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def grade(cls, name: str = "Grade1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "white": MockArrayKnob(
+                "white", value=[1.0, 1.0, 1.0, 1.0], dims=4, knob_class="Color_Knob"
+            ),
+            "black": MockArrayKnob(
+                "black", value=[0.0, 0.0, 0.0, 0.0], dims=4, knob_class="Color_Knob"
+            ),
+            "gain": MockArrayKnob(
+                "gain", value=[1.0, 1.0, 1.0, 1.0], dims=4, knob_class="Color_Knob"
+            ),
+            "mix": MockKnob("mix", value=1.0),
+        }
+        return cls(name=name, node_class="Grade", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def colorcorrect(
+        cls, name: str = "ColorCorrect1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "saturation": MockKnob("saturation", value=1.0),
+            "contrast": MockKnob("contrast", value=1.0),
+            "gamma": MockKnob("gamma", value=1.0),
+        }
+        return cls(name=name, node_class="ColorCorrect", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def huecorrect(cls, name: str = "HueCorrect1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "hue": MockKnob("hue", value=""),
+        }
+        return cls(name=name, node_class="HueCorrect", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def ociocolorspace(
+        cls, name: str = "OCIOColorSpace1", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "in_colorspace": MockKnob("in_colorspace", value="ACES - ACEScg"),
+            "out_colorspace": MockKnob("out_colorspace", value="ACES - ACEScct"),
+        }
+        return cls(name=name, node_class="OCIOColorSpace", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def group(cls, name: str = "Group1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {}
+        return cls(name=name, node_class="Group", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def backdrop(
+        cls, name: str = "BackdropNode1", label: str = "", xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "label": MockKnob("label", value=label),
+            "tile_color": MockKnob("tile_color", value=0x808080FF),
+            "bdwidth": MockKnob("bdwidth", value=200),
+            "bdheight": MockKnob("bdheight", value=150),
+        }
+        return cls(name=name, node_class="BackdropNode", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def switch(
+        cls, name: str = "Switch1", which: int = 0, xpos: int = 0, ypos: int = 0
+    ) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {"which": MockKnob("which", value=which)}
+        node = cls(name=name, node_class="Switch", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def card(cls, name: str = "Card1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "translate": MockArrayKnob(
+                "translate", value=[0.0, 0.0, 0.0], dims=3, knob_class="XYZ_Knob"
+            ),
+            "rotate": MockArrayKnob("rotate", value=[0.0, 0.0, 0.0], dims=3, knob_class="XYZ_Knob"),
+        }
+        return cls(name=name, node_class="Card3D", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def project3d(cls, name: str = "Project3D1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "project_on": MockEnumKnob("project_on", value="back"),
+            "crop": MockBoolKnob("crop", value=True),
+        }
+        node = cls(name=name, node_class="Project3D2", knobs=knobs, xpos=xpos, ypos=ypos)
+        node._inputs = [None, None]
+        return node
+
+    @classmethod
+    def zdefocus(cls, name: str = "ZDefocus1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "math": MockEnumKnob("math", value="depth"),
+            "channels": MockChannelKnob("channels", value="rgba"),
+            "size": MockKnob("size", value=10.0),
+            "depth": MockChannelKnob("depth", value="depth.z"),
+        }
+        return cls(name=name, node_class="ZDefocus2", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def relight(cls, name: str = "Relight1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "output": MockEnumKnob("output", value="rgb"),
+        }
+        return cls(name=name, node_class="ReLight", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def premult(cls, name: str = "Premult1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "channels": MockChannelKnob("channels", value="rgb"),
+            "alpha": MockChannelKnob("alpha", value="alpha"),
+        }
+        return cls(name=name, node_class="Premult", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def filtererode(cls, name: str = "FilterErode1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "channels": MockChannelKnob("channels", value="alpha"),
+            "size": MockKnob("size", value=-0.5),
+            "filter": MockEnumKnob("filter", value="gaussian"),
+        }
+        return cls(name=name, node_class="FilterErode", knobs=knobs, xpos=xpos, ypos=ypos)
+
+    @classmethod
+    def edgeblur(cls, name: str = "EdgeBlur1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "size": MockKnob("size", value=3.0),
+            "channels": MockChannelKnob("channels", value="alpha"),
+        }
+        return cls(name=name, node_class="EdgeBlur", knobs=knobs, xpos=xpos, ypos=ypos)
+
+
+# ---------------------------------------------------------------------------
+# Registry: name -> MockNukeNode (mirrors nuke.toNode)
+# ---------------------------------------------------------------------------
+
+
+class MockNukeScript:
+    """Live-graph registry of MockNukeNodes accessible by name.
+
+    Used by tests that exercise tools through the addon path while still
+    wanting an in-memory graph to inspect. Tests opt in via the
+    ``mock_script`` fixture; existing dict-based tests are untouched.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: dict[str, MockNukeNode] = {}
+
+    def add(self, node: MockNukeNode) -> MockNukeNode:
+        self._nodes[node.name()] = node
+        return node
+
+    def remove(self, name: str) -> bool:
+        return self._nodes.pop(name, None) is not None
+
+    def get(self, name: str) -> MockNukeNode | None:
+        return self._nodes.get(name)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._nodes
+
+    def __iter__(self):
+        return iter(self._nodes.values())
+
+    def __len__(self) -> int:
+        return len(self._nodes)
+
+    def names(self) -> list[str]:
+        return list(self._nodes.keys())
+
+    def all_nodes(self, node_class: str | None = None) -> list[MockNukeNode]:
+        if node_class is None:
+            return list(self._nodes.values())
+        return [n for n in self._nodes.values() if n.Class() == node_class]
+
+    def clear(self) -> None:
+        self._nodes.clear()
+
+
+# ---------------------------------------------------------------------------
+# MockNukeServer -- wire-protocol fake
+# ---------------------------------------------------------------------------
 
 
 class MockNukeServer:
@@ -24,6 +774,11 @@ class MockNukeServer:
         self.keyframes: dict[str, dict[str, list[dict]]] = {}
         self._snapshots: dict[str, dict] = {}
         self._snap_counter = 0
+        # Recorded execute_python payloads. Tests that ship f-string Python
+        # blobs (comp/render/channels/roto/viewer) can assert on
+        # ``mock_server.executed_code`` to lock in the current behaviour
+        # before A3 migrates to typed handlers.
+        self.executed_code: list[str] = []
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -33,6 +788,9 @@ class MockNukeServer:
             "colorspace": "ACES",
             "node_count": 0,
         }
+        # Optional MockNukeNode-backed registry. Default-empty; tests opt in
+        # via the ``mock_script`` fixture which attaches one.
+        self.script: MockNukeScript | None = None
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -59,6 +817,7 @@ class MockNukeServer:
 
     def _loop(self) -> None:
         while self._running:
+            assert self._sock is not None
             try:
                 client, _ = self._sock.accept()
             except (TimeoutError, OSError):
@@ -125,6 +884,7 @@ class MockNukeServer:
             "set_node_position": self._set_node_position,
         }.get(cmd)
 
+        resp: dict[str, Any]
         if handler is None:
             resp = {"status": "error", "error": f"unknown command: {cmd}"}
             if rid is not None:
@@ -184,6 +944,10 @@ class MockNukeServer:
         if p.get("connect_to") and p["connect_to"] in self.nodes:
             self.connections[name] = [p["connect_to"]]
 
+        # mirror to MockNukeScript registry if attached
+        if self.script is not None and name not in self.script:
+            self.script.add(MockNukeNode(name=name, node_class=node_type))
+
         return {"name": name, "type": node_type, "x": 0, "y": 0}
 
     def _delete_node(self, p: dict) -> dict:
@@ -192,6 +956,8 @@ class MockNukeServer:
             raise ValueError(f"node not found: {name}")
         del self.nodes[name]
         self.connections.pop(name, None)
+        if self.script is not None:
+            self.script.remove(name)
         return {"deleted": name}
 
     def _modify_node(self, p: dict) -> dict:
@@ -301,7 +1067,9 @@ class MockNukeServer:
         return {"nodes": nodes, "count": len(nodes)}
 
     def _execute_python(self, p: dict) -> dict:
-        # in tests, just return empty result
+        # record the code so tests can assert on the string-injected payload
+        code = p.get("code", "")
+        self.executed_code.append(code)
         return {}
 
     def _render(self, p: dict) -> dict:
@@ -462,4 +1230,23 @@ def connected(mock_server):
     server, port = mock_server
     connection.connect("localhost", port)
     yield server
+    connection.disconnect()
+
+
+@pytest.fixture
+def mock_script(mock_server):
+    """Connected mock-server with a MockNukeScript registry attached.
+
+    Tests can pre-populate via ``mock_script.add(MockNukeNode.read("Plate"))``
+    and then drive tools that ship execute_python payloads. The recorded
+    payloads land in ``server.executed_code`` for assertion.
+
+    Yields a tuple ``(server, script)`` so tests get both halves.
+    """
+    from nuke_mcp import connection
+
+    server, port = mock_server
+    server.script = MockNukeScript()
+    connection.connect("localhost", port)
+    yield server, server.script
     connection.disconnect()
