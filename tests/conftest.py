@@ -121,6 +121,7 @@ class MockNukeServer:
             "create_nodes": self._create_nodes,
             "set_knobs": self._set_knobs,
             "disconnect_input": self._disconnect_input,
+            "set_node_position": self._set_node_position,
         }.get(cmd)
 
         if handler is None:
@@ -410,6 +411,20 @@ class MockNukeServer:
         if idx < len(conns):
             conns[idx] = None
         return {"node": node, "input": idx, "disconnected": True}
+
+    def _set_node_position(self, p: dict) -> dict:
+        positions = p.get("positions", [])
+        results = []
+        for pos in positions:
+            name = pos["node"]
+            if name not in self.nodes:
+                results.append({"node": name, "error": "not found"})
+                continue
+            x, y = int(pos["x"]), int(pos["y"])
+            self.nodes[name]["x"] = x
+            self.nodes[name]["y"] = y
+            results.append({"node": name, "x": x, "y": y})
+        return {"results": results, "count": len(results)}
 
 
 @pytest.fixture

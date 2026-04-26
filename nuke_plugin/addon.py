@@ -206,6 +206,12 @@ _SKIP_KNOBS = frozenset(
     }
 )
 
+CLASS_ALIASES: dict[str, str] = {
+    "Checkerboard": "CheckerBoard2",
+    "checkerboard": "CheckerBoard2",
+    "CheckerBoard": "CheckerBoard2",
+}
+
 # -- command handlers --
 # each takes a params dict and returns a result dict
 # these run on Nuke's main thread via executeInMainThreadWithResult
@@ -249,8 +255,10 @@ def _handle_get_node_info(params: dict) -> dict:
             or knob.hasExpression()
             or (hasattr(knob, "isDefault") and not knob.isDefault())
         ):
-            with contextlib.suppress(Exception):
+            try:
                 knobs[k] = knob.value()
+            except Exception:
+                knobs[k] = "<unreadable>"
 
     return {
         "name": node.name(),
@@ -267,18 +275,13 @@ def _handle_get_node_info(params: dict) -> dict:
 def _handle_create_node(params: dict) -> dict:
     import nuke
 
-    node_type = params["type"]
+    node_type = CLASS_ALIASES.get(params["type"], params["type"])
     name = params.get("name")
     position = params.get("position")
     connect_to = params.get("connect_to")
     knobs_to_set = params.get("knobs", {})
 
-    # deselect all to prevent auto-connection to "current" node
-    if not connect_to:
-        for n in nuke.selectedNodes():
-            n.setSelected(False)
-
-    node = nuke.createNode(node_type, inpanel=False)
+    node = getattr(nuke.nodes, node_type)()
     if name:
         node.setName(name)
     if position:
@@ -462,16 +465,9 @@ def _handle_set_knob(params: dict) -> dict:
 
     value = params["value"]
 
-    # handle multi-value knobs: if a scalar is passed to a knob that expects
-    # multiple values (e.g. size [x,y], color [r,g,b,a]), expand it
-    if isinstance(value, int | float):
-        knob_class = type(knob).__name__
-        if knob_class in ("XY_Knob", "WH_Knob"):
-            value = [float(value), float(value)]
-        elif knob_class == "XYZ_Knob":
-            value = [float(value), float(value), float(value)]
-        elif knob_class == "AColor_Knob":
-            value = [float(value)] * 4
+    # expand scalar to multi-value if knob is multi-dimensional
+    if isinstance(value, int | float) and hasattr(knob, "dimensions") and knob.dimensions() > 1:
+        value = [float(value)] * knob.dimensions()
 
     # handle list/array values for multi-value knobs
     if isinstance(value, list):
@@ -529,59 +525,77 @@ def _handle_read_comp(params: dict) -> dict:
 
     result = []
     for n in nodes:
-        entry: dict[str, Any] = {
-            "name": n.name(),
-            "type": n.Class(),
-        }
+        try:
+            entry: dict[str, Any] = {
+                "name": n.name(),
+                "type": n.Class(),
+            }
 
-        # inputs
-        inputs = []
-        for i in range(n.inputs()):
-            inp = n.input(i)
-            inputs.append(inp.name() if inp else None)
-        if any(inputs):
-            entry["inputs"] = inputs
+            # inputs
+            inputs = []
+            for i in range(n.inputs()):
+                inp = n.input(i)
+                inputs.append(inp.name() if inp else None)
+            if any(inputs):
+                entry["inputs"] = inputs
 
-        if n.hasError():
-            entry["error"] = True
+            if n.hasError():
+                entry["error"] = True
 
-        # summary mode: skip knobs and expressions to save tokens
-        if not summary:
-            changed: dict[str, Any] = {}
-            for k in n.knobs():
-                if k in _SKIP_KNOBS:
-                    continue
-                knob = n.knob(k)
-                if (
-                    knob.isAnimated()
-                    or knob.hasExpression()
-                    or (hasattr(knob, "isDefault") and not knob.isDefault())
-                ):
-                    with contextlib.suppress(Exception):
-                        val = knob.value()
-                        if isinstance(val, str) and len(val) > 500:
-                            changed[k] = f"<{len(val)} chars>"
-                        elif isinstance(val, int | float | str | bool | list | tuple):
-                            changed[k] = val
-            if changed:
-                entry["knobs"] = changed
+            # summary mode: skip knobs and expressions to save tokens
+            if not summary:
+                changed: dict[str, Any] = {}
+                for k in n.knobs():
+                    if k in _SKIP_KNOBS:
+                        continue
+                    knob = n.knob(k)
+                    try:
+                        is_relevant = (
+                            knob.isAnimated()
+                            or knob.hasExpression()
+                            or (hasattr(knob, "isDefault") and not knob.isDefault())
+                        )
+                    except Exception:
+                        continue
+                    if is_relevant:
+                        try:
+                            val = knob.value()
+                            if isinstance(val, str) and len(val) > 500:
+                                changed[k] = f"<{len(val)} chars>"
+                            elif isinstance(val, int | float | str | bool | list | tuple):
+                                changed[k] = val
+                        except Exception:
+                            changed[k] = "<unreadable>"
+                if changed:
+                    entry["knobs"] = changed
 
-            # expressions
-            exprs = {}
-            for k in n.knobs():
-                knob = n.knob(k)
-                if knob.hasExpression():
-                    exprs[k] = knob.expression()
-            if exprs:
-                entry["expressions"] = exprs
+                # expressions
+                exprs = {}
+                for k in n.knobs():
+                    knob = n.knob(k)
+                    try:
+                        if knob.hasExpression():
+                            exprs[k] = knob.expression()
+                    except Exception:
+                        pass
+                if exprs:
+                    entry["expressions"] = exprs
 
-            # group internals (one level only to save tokens)
-            if hasattr(n, "nodes") and depth > 0:
-                children = n.nodes()
-                if children:
-                    entry["children"] = [{"name": c.name(), "type": c.Class()} for c in children]
+                # group internals (one level only to save tokens)
+                if hasattr(n, "nodes") and depth > 0:
+                    try:
+                        children = n.nodes()
+                        if children:
+                            entry["children"] = [
+                                {"name": c.name(), "type": c.Class()} for c in children
+                            ]
+                    except Exception:
+                        pass
 
-        result.append(entry)
+            result.append(entry)
+        except Exception:
+            # absolute fallback: if even name()/Class() fails, skip the node
+            result.append({"name": "<error>", "type": "<error>", "error": True})
 
     resp: dict[str, Any] = {"nodes": result, "count": len(result), "total": total}
     if offset or limit:
@@ -599,40 +613,47 @@ def _handle_read_selected(params: dict) -> dict:
 
     result = []
     for n in nodes:
-        entry = {"name": n.name(), "type": n.Class()}
+        try:
+            entry = {"name": n.name(), "type": n.Class()}
 
-        inputs = []
-        for i in range(n.inputs()):
-            inp = n.input(i)
-            inputs.append(inp.name() if inp else None)
-        if any(inputs):
-            entry["inputs"] = inputs
+            inputs = []
+            for i in range(n.inputs()):
+                inp = n.input(i)
+                inputs.append(inp.name() if inp else None)
+            if any(inputs):
+                entry["inputs"] = inputs
 
-        changed: dict[str, Any] = {}
-        for k in n.knobs():
-            if k in _SKIP_KNOBS:
-                continue
-            knob = n.knob(k)
-            if (
-                knob.isAnimated()
-                or knob.hasExpression()
-                or (hasattr(knob, "isDefault") and not knob.isDefault())
-            ):
+            changed: dict[str, Any] = {}
+            for k in n.knobs():
+                if k in _SKIP_KNOBS:
+                    continue
+                knob = n.knob(k)
                 try:
-                    val = knob.value()
-                    if isinstance(val, str) and len(val) > 500:
-                        changed[k] = f"<{len(val)} chars>"
-                    elif isinstance(val, int | float | str | bool | list):
-                        changed[k] = val
+                    is_relevant = (
+                        knob.isAnimated()
+                        or knob.hasExpression()
+                        or (hasattr(knob, "isDefault") and not knob.isDefault())
+                    )
                 except Exception:
-                    pass
-        if changed:
-            entry["knobs"] = changed
+                    continue
+                if is_relevant:
+                    try:
+                        val = knob.value()
+                        if isinstance(val, str) and len(val) > 500:
+                            changed[k] = f"<{len(val)} chars>"
+                        elif isinstance(val, int | float | str | bool | list | tuple):
+                            changed[k] = val
+                    except Exception:
+                        changed[k] = "<unreadable>"
+            if changed:
+                entry["knobs"] = changed
 
-        if n.hasError():
-            entry["error"] = True
+            if n.hasError():
+                entry["error"] = True
 
-        result.append(entry)
+            result.append(entry)
+        except Exception:
+            result.append({"name": "<error>", "type": "<error>", "error": True})
 
     return {"nodes": result, "count": len(result)}
 
@@ -897,11 +918,8 @@ def _handle_create_nodes(params: dict) -> dict:
     specs = params.get("nodes", [])
     created = []
     for spec in specs:
-        # deselect all to prevent auto-connection
-        for n in nuke.selectedNodes():
-            n.setSelected(False)
-
-        node = nuke.createNode(spec["type"], inpanel=False)
+        ntype = CLASS_ALIASES.get(spec["type"], spec["type"])
+        node = getattr(nuke.nodes, ntype)()
         if spec.get("name"):
             node.setName(spec["name"])
         if spec.get("connect_to"):
@@ -913,7 +931,7 @@ def _handle_create_nodes(params: dict) -> dict:
             if knob:
                 knob.setValue(v)
         created.append({"name": node.name(), "type": node.Class()})
-    return {"created": created, "count": len(created)}
+    return {"nodes": created, "count": len(created)}
 
 
 def _handle_set_knobs(params: dict) -> dict:
@@ -932,6 +950,8 @@ def _handle_set_knobs(params: dict) -> dict:
             results.append({"node": op["node"], "knob": op["knob"], "error": "knob not found"})
             continue
         value = op["value"]
+        if isinstance(value, int | float) and hasattr(knob, "dimensions") and knob.dimensions() > 1:
+            value = [float(value)] * knob.dimensions()
         if isinstance(value, list):
             for i, v in enumerate(value):
                 knob.setValue(float(v), i)
@@ -954,6 +974,22 @@ def _handle_disconnect_input(params: dict) -> dict:
     old_name = old_input.name() if old_input else None
     node.setInput(input_idx, None)
     return {"node": name, "input": input_idx, "disconnected": old_name}
+
+
+def _handle_set_node_position(params: dict) -> dict:
+    """Set x/y position of one or more nodes in the DAG."""
+    import nuke
+
+    positions = params.get("positions", [])
+    results = []
+    for pos in positions:
+        node = nuke.toNode(pos["node"])
+        if node is None:
+            results.append({"node": pos["node"], "error": "not found"})
+            continue
+        node.setXYpos(int(pos["x"]), int(pos["y"]))
+        results.append({"node": node.name(), "x": node.xpos(), "y": node.ypos()})
+    return {"results": results, "count": len(results)}
 
 
 # handler registry
@@ -987,4 +1023,5 @@ HANDLERS: dict[str, Any] = {
     "create_nodes": _handle_create_nodes,
     "set_knobs": _handle_set_knobs,
     "disconnect_input": _handle_disconnect_input,
+    "set_node_position": _handle_set_node_position,
 }

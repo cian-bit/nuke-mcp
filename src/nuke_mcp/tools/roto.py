@@ -24,7 +24,7 @@ import nuke
 src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
-r = nuke.createNode({roto_type!r}, inpanel=False)
+r = getattr(nuke.nodes, {roto_type!r})()
 r.setInput(0, src)
 r.setXYpos(src.xpos(), src.ypos() + 60)
 __result__ = {{"name": r.name(), "type": r.Class()}}
@@ -53,12 +53,12 @@ if not curve_knob:
 root_layer = curve_knob.rootLayer
 shapes = []
 def walk(layer, prefix=""):
-    for i in range(layer.getNumItems()):
-        item = layer.getItem(i)
+    for i in range(len(layer)):
+        item = layer[i]
         name = item.name if hasattr(item, "name") else str(i)
         item_type = type(item).__name__
         shapes.append({{"name": prefix + name, "type": item_type}})
-        if hasattr(item, "getNumItems"):
+        if hasattr(item, "__len__"):
             walk(item, prefix + name + "/")
 walk(root_layer)
 __result__ = {{"node": {node!r}, "shapes": shapes, "count": len(shapes)}}

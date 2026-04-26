@@ -165,3 +165,18 @@ def register(ctx: ServerContext) -> None:
             input_index: which input to disconnect (0-based).
         """
         return connection.send("disconnect_input", node=node, input=input_index)
+
+    @ctx.mcp.tool(output_schema=None)
+    @nuke_command("set_node_position")
+    def set_node_position(positions: str) -> dict:
+        """Set x/y positions for one or more nodes in the DAG. Use for manual layout
+        control -- position the main pipe vertically and branch side chains to the right.
+
+        Args:
+            positions: JSON array of {node, x, y} objects.
+                       example: '[{"node":"Grade1","x":0,"y":200},{"node":"Blur1","x":200,"y":200}]'
+        """
+        import json as _json
+
+        parsed = _json.loads(positions)
+        return connection.send("set_node_position", positions=parsed)

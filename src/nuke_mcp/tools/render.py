@@ -31,7 +31,7 @@ import nuke
 src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
-w = nuke.createNode("Write", inpanel=False)
+w = nuke.nodes.Write()
 w.setInput(0, src)
 w["file"].setValue({path!r})
 w["file_type"].setValue({file_type!r})
@@ -96,7 +96,7 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
         """
         precomp_name = name or source_node
         code = f"""
-import nuke, os
+import nuke, os, tempfile
 
 src = nuke.toNode({source_node!r})
 if not src:
@@ -104,7 +104,7 @@ if not src:
 
 # auto-generate path from script location
 script_path = nuke.root().name()
-script_dir = os.path.dirname(script_path) if script_path else "/tmp"
+script_dir = os.path.dirname(script_path) if script_path else tempfile.gettempdir()
 script_base = os.path.splitext(os.path.basename(script_path))[0] if script_path else "untitled"
 precomp_dir = os.path.join(script_dir, "precomp", {precomp_name!r})
 os.makedirs(precomp_dir, exist_ok=True)
@@ -123,7 +123,7 @@ for dep in dependents:
 first = int(nuke.root()["first_frame"].value())
 last = int(nuke.root()["last_frame"].value())
 
-w = nuke.createNode("Write", inpanel=False)
+w = nuke.nodes.Write()
 w.setName("{precomp_name}_write")
 w.setInput(0, src)
 w["file"].setValue(out_path)
@@ -133,7 +133,7 @@ w["last"].setValue(last)
 w.setXYpos(src.xpos(), src.ypos() + 80)
 
 # create Read
-r = nuke.createNode("Read", inpanel=False)
+r = nuke.nodes.Read()
 r.setName("{precomp_name}_read")
 r["file"].setValue(out_path)
 r["first"].setValue(first)

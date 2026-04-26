@@ -42,7 +42,7 @@ import nuke
 src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
-s = nuke.createNode("Shuffle2", inpanel=False)
+s = nuke.nodes.Shuffle2()
 s.setInput(0, src)
 s["in1"].setValue({from_layer!r})
 s["out1"].setValue({to_layer!r})
@@ -76,7 +76,7 @@ if len(nodes) < 2:
 prev = nodes[0]
 merges = []
 for i in range(1, len(nodes)):
-    m = nuke.createNode("Merge2", inpanel=False)
+    m = nuke.nodes.Merge2()
     m["operation"].setValue("plus")
     m.setInput(1, prev)
     m.setInput(0, nodes[i])

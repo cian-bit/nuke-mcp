@@ -30,22 +30,22 @@ if not src:
 keyer_type = {keyer_type!r}
 x, y = src.xpos(), src.ypos()
 
-keyer = nuke.createNode(keyer_type, inpanel=False)
+keyer = getattr(nuke.nodes, keyer_type)()
 keyer.setInput(0, src)
 keyer.setXYpos(x, y + 60)
 
-erode = nuke.createNode("FilterErode", inpanel=False)
+erode = nuke.nodes.FilterErode()
 erode.setInput(0, keyer)
 erode["channels"].setValue("alpha")
 erode["size"].setValue(-0.5)
 erode.setXYpos(x, y + 120)
 
-edge = nuke.createNode("EdgeBlur", inpanel=False)
+edge = nuke.nodes.EdgeBlur()
 edge.setInput(0, erode)
 edge["size"].setValue(3)
 edge.setXYpos(x, y + 180)
 
-premult = nuke.createNode("Premult", inpanel=False)
+premult = nuke.nodes.Premult()
 premult.setInput(0, edge)
 premult.setXYpos(x, y + 240)
 
@@ -75,7 +75,7 @@ src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
 
-cc = nuke.createNode({operation!r}, inpanel=False)
+cc = getattr(nuke.nodes, {operation!r})()
 cc.setInput(0, src)
 cc.setXYpos(src.xpos(), src.ypos() + 60)
 
@@ -107,7 +107,7 @@ if not fg_node:
 if not bg_node:
     raise ValueError("bg node not found: {bg}")
 
-merge = nuke.createNode("Merge2", inpanel=False)
+merge = nuke.nodes.Merge2()
 merge["operation"].setValue({operation!r})
 merge.setInput(0, bg_node)  # A pipe = bg
 merge.setInput(1, fg_node)  # B pipe = fg
@@ -136,7 +136,7 @@ src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
 
-t = nuke.createNode({operation!r}, inpanel=False)
+t = getattr(nuke.nodes, {operation!r})()
 t.setInput(0, src)
 t.setXYpos(src.xpos(), src.ypos() + 60)
 
@@ -159,7 +159,7 @@ src = nuke.toNode({input_node!r})
 if not src:
     raise ValueError("node not found: {input_node}")
 
-dn = nuke.createNode("Denoise2", inpanel=False)
+dn = nuke.nodes.Denoise2()
 dn.setInput(0, src)
 dn.setXYpos(src.xpos(), src.ypos() + 60)
 
