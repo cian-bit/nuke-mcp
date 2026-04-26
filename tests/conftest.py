@@ -89,6 +89,7 @@ class MockNukeServer:
     def _dispatch(self, msg: dict) -> dict:
         cmd = msg.get("type", "")
         params = msg.get("params", {})
+        rid = msg.get("_request_id")
 
         handler = {
             "ping": self._ping,
@@ -125,13 +126,19 @@ class MockNukeServer:
         }.get(cmd)
 
         if handler is None:
-            return {"status": "error", "error": f"unknown command: {cmd}"}
+            resp = {"status": "error", "error": f"unknown command: {cmd}"}
+            if rid is not None:
+                resp["_request_id"] = rid
+            return resp
 
         try:
             result = handler(params)
-            return {"status": "ok", "result": result}
+            resp = {"status": "ok", "result": result}
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            resp = {"status": "error", "error": str(e), "error_class": type(e).__name__}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
     def _ping(self, p: dict) -> dict:
         return {"pong": True}
@@ -425,6 +432,17 @@ class MockNukeServer:
             self.nodes[name]["y"] = y
             results.append({"node": name, "x": x, "y": y})
         return {"results": results, "count": len(results)}
+
+
+@pytest.fixture(autouse=True)
+def _disable_heartbeat(monkeypatch):
+    """Heartbeat thread off by default in tests.
+
+    Most tests don't exercise the heartbeat and a 5s interval thread
+    holding the I/O lock makes them flaky. Tests that need heartbeat
+    behavior re-enable it explicitly.
+    """
+    monkeypatch.setenv("NUKE_MCP_HEARTBEAT", "0")
 
 
 @pytest.fixture

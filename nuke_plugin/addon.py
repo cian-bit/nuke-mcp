@@ -55,11 +55,42 @@ def is_running() -> bool:
     return _running
 
 
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive with aggressive per-OS tuning.
+
+    Layered cross-platform: every socket gets SO_KEEPALIVE; per-OS
+    tunings are wrapped in try/except so a missing constant on one
+    platform doesn't break the others. Surfaces a torn TCP stream
+    within a few seconds of a Nuke crash instead of waiting for the
+    next handler call to time out.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError):
+        return
+
+    # Linux
+    with contextlib.suppress(OSError, AttributeError):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 1)  # type: ignore[attr-defined]
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)  # type: ignore[attr-defined]
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)  # type: ignore[attr-defined]
+
+    # Windows
+    with contextlib.suppress(OSError, AttributeError):
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 1000, 1000))  # type: ignore[attr-defined]
+
+    # macOS
+    with contextlib.suppress(OSError, AttributeError):
+        tcp_keepalive = getattr(socket, "TCP_KEEPALIVE", 0x10)
+        sock.setsockopt(socket.IPPROTO_TCP, tcp_keepalive, 1)
+
+
 def _server_loop(port: int) -> None:
     global _server_socket
     try:
         _server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _enable_keepalive(_server_socket)
         _server_socket.bind(("127.0.0.1", port))
         _server_socket.listen(1)
         _server_socket.settimeout(1.0)
@@ -72,6 +103,7 @@ def _server_loop(port: int) -> None:
             except OSError:
                 break
 
+            _enable_keepalive(client)
             log.info("client connected from %s", addr)
             _handle_client(client)
             log.info("client disconnected")
@@ -136,29 +168,48 @@ def _handle_client(client: socket.socket) -> None:
 
 
 def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
-    """Route a command to the right handler, executed on Nuke's main thread."""
+    """Route a command to the right handler, executed on Nuke's main thread.
+
+    A2: echoes ``_request_id`` from the top-level payload back in the
+    response so the MCP-side ``send()`` can assert round-trip identity.
+    The id lives at the payload root, not inside ``params``.
+    """
     import nuke
 
     cmd = msg.get("type", "")
     params = msg.get("params", {})
+    rid = msg.get("_request_id")
 
     if cmd == "ping":
-        return {"status": "ok", "result": {"pong": True}}
+        resp = {"status": "ok", "result": {"pong": True}}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
     # build the code string to execute on the main thread
     handler = HANDLERS.get(cmd)
     if handler is None:
-        return {"status": "error", "error": f"unknown command: {cmd}"}
+        resp = {"status": "error", "error": f"unknown command: {cmd}"}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
     try:
         result = nuke.executeInMainThreadWithResult(handler, args=(params,))
-        return {"status": "ok", "result": result}
+        resp = {"status": "ok", "result": result}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
     except Exception as e:
-        return {
+        resp = {
             "status": "error",
             "error": str(e),
+            "error_class": type(e).__name__,
             "traceback": traceback.format_exc(),
         }
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
 
 def _json_safe(obj: Any) -> Any:

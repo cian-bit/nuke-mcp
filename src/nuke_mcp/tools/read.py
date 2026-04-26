@@ -7,6 +7,8 @@ structured data with only non-default knob values to save tokens.
 
 from __future__ import annotations
 
+from typing import Any
+
 from nuke_mcp import connection
 from nuke_mcp.tools._helpers import nuke_command
 
@@ -42,7 +44,7 @@ def register(ctx: ServerContext) -> None:
             offset: skip this many nodes (for pagination). default 0.
             limit: max nodes to return. 0 means all. use with offset to page through large comps.
         """
-        params: dict[str, str | int | bool] = {"depth": depth}
+        params: dict[str, Any] = {"depth": depth}
         if root:
             params["root"] = root
         if summary:
