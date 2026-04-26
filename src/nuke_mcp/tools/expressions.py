@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.tools import _safety
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -17,11 +18,22 @@ def register(ctx: ServerContext) -> None:
 
         Common expressions: frame, frame/24.0, sin(frame*0.1), [value other_node.knob]
 
+        A regex pre-flight rejects expressions that wrap forbidden Python
+        calls in ``[python ...]`` callouts or invoke TCL ``system``/``exec``/
+        ``unlink`` directly.
+
         Args:
             node: node name.
             knob: knob name to set expression on.
             expression: Nuke TCL expression string.
         """
+        finding = _safety.validate_tcl(expression)
+        if finding is not None:
+            return {
+                "status": "blocked",
+                "findings": [_safety.finding_to_dict(finding)],
+                "error": "expression blocked by safety scanner",
+            }
         return connection.send("set_expression", node=node, knob=knob, expression=expression)
 
     @ctx.mcp.tool(output_schema=None)
