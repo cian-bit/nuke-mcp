@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import DESTRUCTIVE, OPEN_WORLD
 from nuke_mcp.tools import _safety
 from nuke_mcp.tools._helpers import nuke_command
 
@@ -16,7 +17,7 @@ if False:
 
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
-        annotations={"destructiveHint": True},
+        annotations=DESTRUCTIVE | OPEN_WORLD,
         output_schema=None,
     )
     @nuke_command("execute_python")

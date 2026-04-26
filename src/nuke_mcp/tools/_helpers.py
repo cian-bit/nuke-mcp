@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import Any
 
 from nuke_mcp import connection
+from nuke_mcp.response import apply_response_shape
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,13 @@ def nuke_command(operation: str) -> Callable[..., Callable[..., dict[str, Any]]]
                 duration_ms,
                 extra={"tool": operation, "duration_ms": duration_ms},
             )
+
+            # B1 response shape: estimate -> truncate -> stamp _meta.
+            # Non-dict returns (rare -- a few tools return primitives) skip
+            # the wrap. apply_response_shape merges into existing _meta so
+            # any duration_ms / request_id another layer added survives.
+            if isinstance(result, dict):
+                result = apply_response_shape(result, operation)
             return result
 
         return wrapper

@@ -9,14 +9,21 @@ from nuke_mcp.tools._helpers import nuke_command
 
 
 def test_nuke_command_success_path():
-    """Successful return passes through with no envelope wrapping."""
+    """Successful return passes through with no envelope wrapping.
+
+    B1 stamps a ``_meta`` block onto every dict response (size_bytes plus
+    truncation flags when applicable). The original tool payload still
+    survives unchanged.
+    """
 
     @nuke_command("test_op")
     def go() -> dict[str, Any]:
         return {"value": 42}
 
     out = go()
-    assert out == {"value": 42}
+    assert out["value"] == 42
+    assert "_meta" in out
+    assert "size_bytes" in out["_meta"]
 
 
 def test_nuke_command_command_error_envelope():

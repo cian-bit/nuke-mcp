@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -18,7 +19,7 @@ if False:
 
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_comp")
@@ -58,7 +59,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("read_comp", **params)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_node_detail")
@@ -73,7 +74,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("get_node_info", name=name)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_selected")
@@ -84,7 +85,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("read_selected")
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("snapshot_comp")
@@ -97,7 +98,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("snapshot_comp")
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("diff_comp")

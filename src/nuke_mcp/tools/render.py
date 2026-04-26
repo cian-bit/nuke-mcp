@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import DESTRUCTIVE, IDEMPOTENT, OPEN_WORLD, READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -10,7 +11,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("setup_write")
     def setup_write(
         input_node: str,
@@ -42,7 +43,7 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
         return connection.send("execute_python", code=code)
 
     @ctx.mcp.tool(
-        annotations={"destructiveHint": True},
+        annotations=DESTRUCTIVE | OPEN_WORLD,
         output_schema=None,
     )
     @nuke_command("render_frames")
@@ -75,7 +76,9 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
             params["frame_range"] = [first_frame, last_frame]
         return connection.send_raw("render", timeout=300.0, **params)
 
-    @ctx.mcp.tool(output_schema=None)
+    # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
+    # ``destructiveHint=False`` so the schema explicitly marks it benign.
+    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
     @nuke_command("setup_precomp")
     def setup_precomp(
         source_node: str,
@@ -155,7 +158,7 @@ __result__ = {{
         return connection.send("execute_python", code=code)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("list_precomps")
