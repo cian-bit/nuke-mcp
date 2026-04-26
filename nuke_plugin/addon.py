@@ -167,12 +167,42 @@ def _handle_client(client: socket.socket) -> None:
             break
 
 
+# B7: per-request node-name -> nuke.Node cache. Stashed on threading.local
+# so handlers can call _resolve_node(name) without each one paying its own
+# nuke.toNode() lookup. _dispatch resets the cache for every request, so
+# a stale cache can't leak across calls.
+_request_local = threading.local()
+
+
+def _resolve_node(name: str) -> Any:
+    """Look up ``name`` via the per-request cache, falling back to ``nuke.toNode``.
+
+    Cache is set up by ``_dispatch`` for the duration of a single request.
+    If no cache is active (e.g. handler called directly from a test), this
+    falls through to ``nuke.toNode`` with no caching.
+    """
+    import nuke
+
+    cache: dict[str, Any] | None = getattr(_request_local, "node_cache", None)
+    if cache is None:
+        return nuke.toNode(name)
+    if name in cache:
+        return cache[name]
+    node = nuke.toNode(name)
+    cache[name] = node
+    return node
+
+
 def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
     """Route a command to the right handler, executed on Nuke's main thread.
 
     A2: echoes ``_request_id`` from the top-level payload back in the
     response so the MCP-side ``send()`` can assert round-trip identity.
     The id lives at the payload root, not inside ``params``.
+
+    B7: installs a fresh per-request ``node_cache`` on ``_request_local``
+    so handlers that touch the same node twice (or that participate in
+    batch operations) avoid redundant ``nuke.toNode`` calls.
     """
     import nuke
 
@@ -194,6 +224,7 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
             resp["_request_id"] = rid
         return resp
 
+    _request_local.node_cache = {}
     try:
         result = nuke.executeInMainThreadWithResult(handler, args=(params,))
         resp = {"status": "ok", "result": result}
@@ -210,6 +241,8 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
         if rid is not None:
             resp["_request_id"] = rid
         return resp
+    finally:
+        _request_local.node_cache = None
 
 
 def _json_safe(obj: Any) -> Any:
@@ -574,6 +607,9 @@ def _handle_read_comp(params: dict) -> dict:
     if limit:
         nodes = nodes[:limit]
 
+    # B7: single-pass knob iteration. The previous implementation walked
+    # ``n.knobs()`` once for changed values and a second time for
+    # expressions. Now we collect both in one pass per node.
     result = []
     for n in nodes:
         try:
@@ -596,14 +632,24 @@ def _handle_read_comp(params: dict) -> dict:
             # summary mode: skip knobs and expressions to save tokens
             if not summary:
                 changed: dict[str, Any] = {}
+                exprs: dict[str, str] = {}
                 for k in n.knobs():
                     if k in _SKIP_KNOBS:
                         continue
                     knob = n.knob(k)
+                    # Single-pass: capture expressions and non-default values
+                    # in the same iteration.
+                    try:
+                        has_expr = knob.hasExpression()
+                    except Exception:
+                        has_expr = False
+                    if has_expr:
+                        with contextlib.suppress(Exception):
+                            exprs[k] = knob.expression()
                     try:
                         is_relevant = (
                             knob.isAnimated()
-                            or knob.hasExpression()
+                            or has_expr
                             or (hasattr(knob, "isDefault") and not knob.isDefault())
                         )
                     except Exception:
@@ -619,16 +665,6 @@ def _handle_read_comp(params: dict) -> dict:
                             changed[k] = "<unreadable>"
                 if changed:
                     entry["knobs"] = changed
-
-                # expressions
-                exprs = {}
-                for k in n.knobs():
-                    knob = n.knob(k)
-                    try:
-                        if knob.hasExpression():
-                            exprs[k] = knob.expression()
-                    except Exception:
-                        pass
                 if exprs:
                     entry["expressions"] = exprs
 
@@ -1043,6 +1079,318 @@ def _handle_set_node_position(params: dict) -> dict:
     return {"results": results, "count": len(results)}
 
 
+# ---------------------------------------------------------------------------
+# A3: typed comp/render handlers
+#
+# These replace the f-string ``execute_python`` blobs that ``comp.py`` and
+# ``render.py:setup_write`` shipped to the addon. Each handler validates
+# its inputs (operation allowlists, path traversal) and raises ValueError
+# on bad input -- ``_dispatch`` formats that into the structured error
+# envelope.
+# ---------------------------------------------------------------------------
+
+# Allowlists -- operations that map to a Nuke node class. Anything
+# outside the set raises ``invalid operation`` so a caller can't drive
+# arbitrary ``getattr(nuke.nodes, X)`` lookups.
+_COLOR_OPERATIONS = frozenset({"Grade", "ColorCorrect", "HueCorrect", "OCIOColorSpace"})
+_MERGE_OPERATIONS = frozenset(
+    {
+        "over",
+        "plus",
+        "multiply",
+        "screen",
+        "stencil",
+        "mask",
+        "minus",
+        "difference",
+        "divide",
+        "from",
+        "copy",
+    }
+)
+_TRANSFORM_OPERATIONS = frozenset({"Transform", "CornerPin2D", "Reformat", "Tracker4"})
+_KEYER_TYPES = frozenset({"Keylight", "Primatte", "IBKGizmo", "Cryptomatte"})
+_WRITE_FILE_TYPES = frozenset({"exr", "tiff", "tif", "png", "jpeg", "jpg", "mov", "dpx"})
+
+
+def _handle_setup_keying(params: dict) -> dict:
+    """Build the standard keying chain: keyer + FilterErode + EdgeBlur + Premult.
+
+    A3 typed: replaces ``comp.py``'s f-string ``execute_python`` payload.
+    Looks up ``input_node`` via the per-request node cache.
+    """
+    import nuke
+
+    input_node = params["input_node"]
+    keyer_type = params.get("keyer_type", "Keylight")
+
+    if keyer_type not in _KEYER_TYPES:
+        raise ValueError(f"invalid keyer_type: {keyer_type}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    # TODO(A3-followup): idempotency -- detect existing keyer chain
+    # downstream of ``input_node`` of the same ``keyer_type`` and return
+    # that instead of creating a duplicate. Skipped here to avoid an
+    # over-engineered first pass; the IDEMPOTENT annotation is honest
+    # only when the caller hasn't run the tool yet.
+
+    x, y = src.xpos(), src.ypos()
+
+    keyer = getattr(nuke.nodes, keyer_type)()
+    keyer.setInput(0, src)
+    keyer.setXYpos(x, y + 60)
+
+    erode = nuke.nodes.FilterErode()
+    erode.setInput(0, keyer)
+    if erode.knob("channels"):
+        erode["channels"].setValue("alpha")
+    if erode.knob("size"):
+        erode["size"].setValue(-0.5)
+    erode.setXYpos(x, y + 120)
+
+    edge = nuke.nodes.EdgeBlur()
+    edge.setInput(0, erode)
+    if edge.knob("size"):
+        edge["size"].setValue(3)
+    edge.setXYpos(x, y + 180)
+
+    premult = nuke.nodes.Premult()
+    premult.setInput(0, edge)
+    premult.setXYpos(x, y + 240)
+
+    return {
+        "keyer": keyer.name(),
+        "erode": erode.name(),
+        "edge_blur": edge.name(),
+        "premult": premult.name(),
+        "tip": "adjust the keyer node settings and erode size to refine the matte",
+    }
+
+
+def _handle_setup_color_correction(params: dict) -> dict:
+    """Create a color-correction node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+    operation = params.get("operation", "Grade")
+
+    if operation not in _COLOR_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    cc = getattr(nuke.nodes, operation)()
+    cc.setInput(0, src)
+    cc.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": cc.name(), "type": cc.Class()}
+
+
+def _handle_setup_merge(params: dict) -> dict:
+    """Create a Merge2 with fg on B pipe (input 1) and bg on A pipe (input 0)."""
+    import nuke
+
+    fg_name = params["fg"]
+    bg_name = params["bg"]
+    operation = params.get("operation", "over")
+
+    if operation not in _MERGE_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    fg_node = _resolve_node(fg_name)
+    bg_node = _resolve_node(bg_name)
+    if fg_node is None:
+        raise ValueError(f"fg node not found: {fg_name}")
+    if bg_node is None:
+        raise ValueError(f"bg node not found: {bg_name}")
+
+    merge = nuke.nodes.Merge2()
+    merge["operation"].setValue(operation)
+    merge.setInput(0, bg_node)  # A pipe = bg
+    merge.setInput(1, fg_node)  # B pipe = fg
+    merge.setXYpos(
+        (fg_node.xpos() + bg_node.xpos()) // 2,
+        max(fg_node.ypos(), bg_node.ypos()) + 80,
+    )
+
+    return {"name": merge.name(), "operation": operation}
+
+
+def _handle_setup_transform(params: dict) -> dict:
+    """Create a transform node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+    operation = params.get("operation", "Transform")
+
+    if operation not in _TRANSFORM_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    t = getattr(nuke.nodes, operation)()
+    t.setInput(0, src)
+    t.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": t.name(), "type": t.Class()}
+
+
+def _handle_setup_denoise(params: dict) -> dict:
+    """Create a Denoise2 node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    dn = nuke.nodes.Denoise2()
+    dn.setInput(0, src)
+    dn.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": dn.name(), "type": dn.Class()}
+
+
+def _handle_setup_write(params: dict) -> dict:
+    """Create a Write node downstream of ``input_node`` with validated path/file_type.
+
+    Path traversal: any ``..`` component in ``path`` is rejected. Absolute
+    path policy is left to a future Phase D pass; for now we accept any
+    absolute or relative path that doesn't traverse upward.
+    """
+    import nuke
+
+    input_node = params["input_node"]
+    path = params["path"]
+    file_type = params.get("file_type", "exr")
+    colorspace = params.get("colorspace", "scene_linear")
+
+    if not isinstance(path, str) or ".." in path:
+        raise ValueError("invalid path: path traversal not permitted")
+    if file_type not in _WRITE_FILE_TYPES:
+        raise ValueError(f"invalid file_type: {file_type}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    w = nuke.nodes.Write()
+    w.setInput(0, src)
+    w["file"].setValue(path)
+    w["file_type"].setValue(file_type)
+    if w.knob("colorspace"):
+        w["colorspace"].setValue(colorspace)
+
+    return {"name": w.name(), "path": path, "file_type": file_type}
+
+
+# ---------------------------------------------------------------------------
+# B7: scene_digest / scene_delta
+#
+# Compact fingerprint of the node graph for delta-aware turn loops. Ports
+# the pattern from houdini-mcp-beta/houdini_mcp/tools/digest.py:28-200.
+# ---------------------------------------------------------------------------
+
+
+def _compute_digest_hash(data: dict[str, Any]) -> str:
+    """Return md5 hex[:8] over the JSON-serialized digest body."""
+    import hashlib
+
+    # Drop ``hash`` and ``status`` from the body before hashing so the
+    # hash is stable across calls.
+    body = {k: v for k, v in data.items() if k not in ("hash", "status", "changed")}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+
+def _build_scene_digest() -> dict[str, Any]:
+    """Build the scene digest body. Used by both digest and delta handlers."""
+    import nuke
+
+    nodes = nuke.allNodes()
+    counts: dict[str, int] = {}
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for n in nodes:
+        try:
+            cls = n.Class()
+        except Exception:
+            continue
+        counts[cls] = counts.get(cls, 0) + 1
+        try:
+            if n.hasError():
+                errors.append(n.name())
+        except Exception:
+            pass
+        try:
+            if hasattr(n, "warnings") and n.warnings():
+                warnings.append(n.name())
+        except Exception:
+            pass
+
+    selected = [n.name() for n in nuke.selectedNodes()]
+
+    viewer_active = ""
+    display_node = ""
+    try:
+        viewer = nuke.activeViewer()
+        if viewer is not None:
+            v_node = viewer.node()
+            if v_node is not None:
+                viewer_active = v_node.name()
+                inp = v_node.input(0)
+                if inp is not None:
+                    display_node = inp.name()
+    except Exception:
+        pass
+
+    body: dict[str, Any] = {
+        "counts": counts,
+        "total": len(nodes),
+        "errors": errors,
+        "warnings": warnings,
+        "selected": selected,
+        "viewer_active": viewer_active,
+        "display_node": display_node,
+    }
+    return body
+
+
+def _handle_scene_digest(params: dict) -> dict:
+    """Return the full scene digest body plus an md5[:8] hash."""
+    body = _build_scene_digest()
+    body["hash"] = _compute_digest_hash(body)
+    return body
+
+
+def _handle_scene_delta(params: dict) -> dict:
+    """Return early ``{"changed": False, "hash": prev_hash}`` if the digest is unchanged.
+
+    On change, returns the full body with ``changed=True`` and the new
+    ``hash``. The delta handler always builds the full body (cheap on a
+    hot Nuke session) so the early-exit is a wire-level optimization
+    rather than a Nuke-side one. The win is the MCP client gets to skip
+    re-rendering large response payloads on no-op turns.
+    """
+    prev_hash = params.get("prev_hash") or ""
+    body = _build_scene_digest()
+    current_hash = _compute_digest_hash(body)
+    if current_hash == prev_hash:
+        return {"changed": False, "hash": current_hash}
+    body["hash"] = current_hash
+    body["changed"] = True
+    return body
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -1075,4 +1423,14 @@ HANDLERS: dict[str, Any] = {
     "set_knobs": _handle_set_knobs,
     "disconnect_input": _handle_disconnect_input,
     "set_node_position": _handle_set_node_position,
+    # A3 typed comp/render handlers
+    "setup_keying": _handle_setup_keying,
+    "setup_color_correction": _handle_setup_color_correction,
+    "setup_merge": _handle_setup_merge,
+    "setup_transform": _handle_setup_transform,
+    "setup_denoise": _handle_setup_denoise,
+    "setup_write": _handle_setup_write,
+    # B7 scene digest
+    "scene_digest": _handle_scene_digest,
+    "scene_delta": _handle_scene_delta,
 }

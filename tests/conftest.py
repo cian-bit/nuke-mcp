@@ -774,11 +774,22 @@ class MockNukeServer:
         self.keyframes: dict[str, dict[str, list[dict]]] = {}
         self._snapshots: dict[str, dict] = {}
         self._snap_counter = 0
-        # Recorded execute_python payloads. Tests that ship f-string Python
-        # blobs (comp/render/channels/roto/viewer) can assert on
-        # ``mock_server.executed_code`` to lock in the current behaviour
-        # before A3 migrates to typed handlers.
+        # Recorded execute_python payloads. After A3 the comp/setup_write
+        # tools no longer reach this path; the channels/roto/viewer/precomp
+        # tools still do, and tests assert on the recorded payloads.
         self.executed_code: list[str] = []
+        # A3: typed-handler call log. Each entry is (cmd, params) so tests
+        # can assert ``("setup_keying", {...})`` round-tripped through the
+        # wire without inspecting f-string blobs.
+        self.typed_calls: list[tuple[str, dict]] = []
+        # B7: counter spy for read_comp single-pass verification. Each time
+        # the mock visits a node entry to serialize knobs we bump this.
+        # test_speed.py asserts the counter equals the node count exactly
+        # (one visit per node, not two).
+        self.read_comp_knob_visits: int = 0
+        # B7: scene_delta call log. Tests assert that on a no-change call
+        # we returned the short-circuit path (no node enumeration).
+        self.scene_delta_short_circuits: int = 0
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -882,6 +893,16 @@ class MockNukeServer:
             "set_knobs": self._set_knobs,
             "disconnect_input": self._disconnect_input,
             "set_node_position": self._set_node_position,
+            # A3 typed handlers
+            "setup_keying": self._setup_keying,
+            "setup_color_correction": self._setup_color_correction,
+            "setup_merge": self._setup_merge,
+            "setup_transform": self._setup_transform,
+            "setup_denoise": self._setup_denoise,
+            "setup_write": self._setup_write,
+            # B7 scene digest
+            "scene_digest": self._scene_digest,
+            "scene_delta": self._scene_delta,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -1030,6 +1051,9 @@ class MockNukeServer:
         for name, data in self.nodes.items():
             if type_filter and data["type"] != type_filter:
                 continue
+            # B7: count one knob visit per node entry. The single-pass
+            # check in test_speed.py asserts visits == nodes-after-filter.
+            self.read_comp_knob_visits += 1
             entry: dict[str, Any] = {"name": name, "type": data["type"]}
             conns = self.connections.get(name, [])
             if any(conns):
@@ -1200,6 +1224,213 @@ class MockNukeServer:
             self.nodes[name]["y"] = y
             results.append({"node": name, "x": x, "y": y})
         return {"results": results, "count": len(results)}
+
+    # ------------------------------------------------------------------
+    # A3 typed handlers
+    #
+    # Each handler:
+    #   * appends ``(cmd, params)`` to ``self.typed_calls`` so tests can
+    #     assert the wire shape without inspecting f-string blobs.
+    #   * validates the same allowlists / inputs the real addon does so
+    #     the mock's error envelope matches production.
+    #   * mutates ``self.nodes`` to simulate node creation, mirroring the
+    #     behaviour of ``_create_node`` so downstream tools see the new
+    #     nodes.
+    # ------------------------------------------------------------------
+
+    _COLOR_OPS = frozenset({"Grade", "ColorCorrect", "HueCorrect", "OCIOColorSpace"})
+    _MERGE_OPS = frozenset(
+        {
+            "over",
+            "plus",
+            "multiply",
+            "screen",
+            "stencil",
+            "mask",
+            "minus",
+            "difference",
+            "divide",
+            "from",
+            "copy",
+        }
+    )
+    _TRANSFORM_OPS = frozenset({"Transform", "CornerPin2D", "Reformat", "Tracker4"})
+    _KEYER_TYPES = frozenset({"Keylight", "Primatte", "IBKGizmo", "Cryptomatte"})
+    _WRITE_TYPES = frozenset({"exr", "tiff", "tif", "png", "jpeg", "jpg", "mov", "dpx"})
+
+    def _next_unique_name(self, base: str) -> str:
+        name = base
+        i = 1
+        while name in self.nodes:
+            i += 1
+            name = f"{base}{i}"
+        return name
+
+    def _setup_keying(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_keying", dict(p)))
+        input_node = p["input_node"]
+        keyer_type = p.get("keyer_type", "Keylight")
+        if keyer_type not in self._KEYER_TYPES:
+            raise ValueError(f"invalid keyer_type: {keyer_type}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+
+        keyer = self._next_unique_name(keyer_type)
+        self.nodes[keyer] = {"type": keyer_type, "knobs": {}, "x": 0, "y": 0}
+        self.connections[keyer] = [input_node]
+
+        erode = self._next_unique_name("FilterErode1")
+        self.nodes[erode] = {
+            "type": "FilterErode",
+            "knobs": {"channels": "alpha", "size": -0.5},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[erode] = [keyer]
+
+        edge = self._next_unique_name("EdgeBlur1")
+        self.nodes[edge] = {"type": "EdgeBlur", "knobs": {"size": 3}, "x": 0, "y": 0}
+        self.connections[edge] = [erode]
+
+        premult = self._next_unique_name("Premult1")
+        self.nodes[premult] = {"type": "Premult", "knobs": {}, "x": 0, "y": 0}
+        self.connections[premult] = [edge]
+
+        return {
+            "keyer": keyer,
+            "erode": erode,
+            "edge_blur": edge,
+            "premult": premult,
+            "tip": "adjust the keyer node settings and erode size to refine the matte",
+        }
+
+    def _setup_color_correction(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_color_correction", dict(p)))
+        input_node = p["input_node"]
+        operation = p.get("operation", "Grade")
+        if operation not in self._COLOR_OPS:
+            raise ValueError(f"invalid operation: {operation}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        name = self._next_unique_name(f"{operation}1")
+        self.nodes[name] = {"type": operation, "knobs": {}, "x": 0, "y": 0}
+        self.connections[name] = [input_node]
+        return {"name": name, "type": operation}
+
+    def _setup_merge(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_merge", dict(p)))
+        fg = p["fg"]
+        bg = p["bg"]
+        operation = p.get("operation", "over")
+        if operation not in self._MERGE_OPS:
+            raise ValueError(f"invalid operation: {operation}")
+        if fg not in self.nodes:
+            raise ValueError(f"fg node not found: {fg}")
+        if bg not in self.nodes:
+            raise ValueError(f"bg node not found: {bg}")
+        name = self._next_unique_name("Merge1")
+        self.nodes[name] = {
+            "type": "Merge2",
+            "knobs": {"operation": operation},
+            "x": 0,
+            "y": 0,
+        }
+        # B pipe = fg (input 1), A pipe = bg (input 0)
+        self.connections[name] = [bg, fg]
+        return {"name": name, "operation": operation}
+
+    def _setup_transform(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_transform", dict(p)))
+        input_node = p["input_node"]
+        operation = p.get("operation", "Transform")
+        if operation not in self._TRANSFORM_OPS:
+            raise ValueError(f"invalid operation: {operation}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        name = self._next_unique_name(f"{operation}1")
+        self.nodes[name] = {"type": operation, "knobs": {}, "x": 0, "y": 0}
+        self.connections[name] = [input_node]
+        return {"name": name, "type": operation}
+
+    def _setup_denoise(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_denoise", dict(p)))
+        input_node = p["input_node"]
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        name = self._next_unique_name("Denoise1")
+        self.nodes[name] = {"type": "Denoise2", "knobs": {}, "x": 0, "y": 0}
+        self.connections[name] = [input_node]
+        return {"name": name, "type": "Denoise2"}
+
+    def _setup_write(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_write", dict(p)))
+        input_node = p["input_node"]
+        path = p["path"]
+        file_type = p.get("file_type", "exr")
+        colorspace = p.get("colorspace", "scene_linear")
+        if not isinstance(path, str) or ".." in path:
+            raise ValueError("invalid path: path traversal not permitted")
+        if file_type not in self._WRITE_TYPES:
+            raise ValueError(f"invalid file_type: {file_type}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        name = self._next_unique_name("Write1")
+        self.nodes[name] = {
+            "type": "Write",
+            "knobs": {"file": path, "file_type": file_type, "colorspace": colorspace},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[name] = [input_node]
+        return {"name": name, "path": path, "file_type": file_type}
+
+    # ------------------------------------------------------------------
+    # B7 scene digest / delta
+    # ------------------------------------------------------------------
+
+    def _build_digest_body(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        errors: list[str] = []
+        warnings: list[str] = []
+        for name, data in self.nodes.items():
+            cls = data["type"]
+            counts[cls] = counts.get(cls, 0) + 1
+            if data.get("error"):
+                errors.append(name)
+            if data.get("warning"):
+                warnings.append(name)
+        return {
+            "counts": counts,
+            "total": len(self.nodes),
+            "errors": errors,
+            "warnings": warnings,
+            "selected": sorted(self.selected),
+            "viewer_active": "",
+            "display_node": "",
+        }
+
+    def _digest_hash(self, body: dict[str, Any]) -> str:
+        import hashlib
+
+        body = {k: v for k, v in body.items() if k not in ("hash", "status", "changed")}
+        raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+    def _scene_digest(self, p: dict) -> dict:
+        body = self._build_digest_body()
+        body["hash"] = self._digest_hash(body)
+        return body
+
+    def _scene_delta(self, p: dict) -> dict:
+        prev_hash = p.get("prev_hash") or ""
+        body = self._build_digest_body()
+        current_hash = self._digest_hash(body)
+        if current_hash == prev_hash:
+            self.scene_delta_short_circuits += 1
+            return {"changed": False, "hash": current_hash}
+        body["hash"] = current_hash
+        body["changed"] = True
+        return body
 
 
 @pytest.fixture(autouse=True)

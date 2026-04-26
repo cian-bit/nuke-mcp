@@ -1,6 +1,8 @@
 """Tests for render.py setup_write / render_frames / setup_precomp / list_precomps.
 
-# A3: rewrite this module's assertions when render.py migrates to typed handlers.
+A3 migrated ``setup_write`` to a typed addon handler with file_type +
+path-traversal allowlists. ``setup_precomp`` and ``list_precomps`` are
+out of A3 scope and still ship f-string ``execute_python`` payloads.
 """
 
 from __future__ import annotations
@@ -35,50 +37,55 @@ class _StubCtx:
 @pytest.fixture
 def render_tools(mock_script):
     server, script = mock_script
+    server.nodes["plate"] = {"type": "Read", "knobs": {}, "x": 0, "y": 0}
+    server.connections["plate"] = []
     ctx = _StubCtx()
     render.register(ctx)
     return server, script, ctx.mcp.registered
 
 
 # ---------------------------------------------------------------------------
-# setup_write
+# setup_write -- A3 typed dispatch
 # ---------------------------------------------------------------------------
 
 
 def test_setup_write_happy_path(render_tools):
     server, _script, tools = render_tools
-    tools["setup_write"]("plate", "/tmp/out/plate.####.exr")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when render.py migrates to typed handlers.
-    assert "'plate'" in code
-    assert "/tmp/out/plate.####.exr" in code
-    assert "'exr'" in code
-    assert "Write" in code
+    result = tools["setup_write"]("plate", "/tmp/out/plate.####.exr")
+    assert result.get("status") != "error"
+    assert server.executed_code == []
+    assert len(server.typed_calls) == 1
+    cmd, params = server.typed_calls[0]
+    assert cmd == "setup_write"
+    assert params == {
+        "input_node": "plate",
+        "path": "/tmp/out/plate.####.exr",
+        "file_type": "exr",
+        "colorspace": "scene_linear",
+    }
 
 
-def test_setup_write_path_traversal_accepted(render_tools):
-    """Path traversal currently passes through unsanitized -- documented hazard
-    that A3 will close. The string-injection layer renders ../../../etc/passwd
-    as a plain Python string literal so it doesn't break the script, but the
-    Write node will still be created with that path. Locking this in.
-    """
-    server, _script, tools = render_tools
-    tools["setup_write"]("plate", "../../../etc/passwd")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when render.py migrates to typed handlers.
-    # path lands in the payload as a Python string literal -- repr-escapes
-    # any traversal characters but doesn't reject the path.
-    assert "/etc/passwd" in code
-    assert "Write" in code
+def test_setup_write_path_traversal_rejected(render_tools):
+    """A3 closes the f-string hazard: ``..`` in a path raises ValueError addon-side."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "../../../etc/passwd")
+    assert result.get("status") == "error"
+    assert "path traversal" in result["error"].lower() or "invalid path" in result["error"].lower()
+
+
+def test_setup_write_invalid_file_type_rejected(render_tools):
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "/tmp/out.bad", file_type="badtype")
+    assert result.get("status") == "error"
+    assert "invalid" in result["error"].lower()
 
 
 def test_setup_write_alternate_format(render_tools):
     server, _script, tools = render_tools
     tools["setup_write"]("plate", "/tmp/out.png", file_type="png", colorspace="sRGB")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when render.py migrates to typed handlers.
-    assert "'png'" in code
-    assert "'sRGB'" in code
+    _cmd, params = server.typed_calls[0]
+    assert params["file_type"] == "png"
+    assert params["colorspace"] == "sRGB"
 
 
 # ---------------------------------------------------------------------------

@@ -93,6 +93,9 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     # roto.py
     "create_roto": _BENIGN_NEW,
     "list_roto_shapes": READ_ONLY,
+    # digest.py (B7)
+    "scene_digest": READ_ONLY,
+    "scene_delta": READ_ONLY,
 }
 
 

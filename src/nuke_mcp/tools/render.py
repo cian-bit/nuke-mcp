@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import DESTRUCTIVE, IDEMPOTENT, OPEN_WORLD, READ_ONLY
+from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -21,26 +22,26 @@ def register(ctx: ServerContext) -> None:
     ) -> dict:
         """Create a Write node connected to input_node with production defaults.
 
+        A3: typed dispatch -- the addon validates ``file_type`` against
+        the allowlist (exr/tiff/png/jpeg/mov/dpx) and rejects any path
+        with a ``..`` traversal component.
+
         Args:
             input_node: node to connect as input.
             path: output file path (use #### for frame padding).
-            file_type: exr, png, jpg, dpx, etc.
+            file_type: exr, tiff, png, jpeg, mov, or dpx.
             colorspace: output colorspace.
         """
-        code = f"""
-import nuke
-src = nuke.toNode({input_node!r})
-if not src:
-    raise ValueError("node not found: {input_node}")
-w = nuke.nodes.Write()
-w.setInput(0, src)
-w["file"].setValue({path!r})
-w["file_type"].setValue({file_type!r})
-if w.knob("colorspace"):
-    w["colorspace"].setValue({colorspace!r})
-__result__ = {{"name": w.name(), "path": {path!r}}}
-"""
-        return connection.send("execute_python", code=code)
+        return run_on_main(
+            "setup_write",
+            {
+                "input_node": input_node,
+                "path": path,
+                "file_type": file_type,
+                "colorspace": colorspace,
+            },
+            "mutate",
+        )
 
     @ctx.mcp.tool(
         annotations=DESTRUCTIVE | OPEN_WORLD,

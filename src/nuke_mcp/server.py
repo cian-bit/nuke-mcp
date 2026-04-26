@@ -12,6 +12,7 @@ from nuke_mcp.tools import (
     channels,
     code,
     comp,
+    digest,
     expressions,
     graph,
     knobs,
@@ -39,13 +40,26 @@ def build_server(mock: bool = False) -> FastMCP:
         ),
     )
 
-    # defer connection to first tool call -- Nuke might not be running yet
-    # the auto-reconnect in connection.send() handles lazy connect
+    # B7 warm connect: try to attach to Nuke up front so the first tool
+    # call doesn't pay the connect+handshake cost. If Nuke isn't running,
+    # the lazy reconnect path in ``connection.send`` still kicks in once
+    # it does come up. Always seed ``_last_host`` / ``_last_port`` so the
+    # reconnect has a target.
+    version: connection.NukeVersion | None = None
     if not mock:
         connection._last_host = NUKE_HOST
         connection._last_port = NUKE_PORT
+        try:
+            version = connection.connect(NUKE_HOST, NUKE_PORT)
+        except (connection.ConnectionError, OSError) as exc:
+            log.warning(
+                "nuke not yet running on %s:%d (%s); will retry on first tool call",
+                NUKE_HOST,
+                NUKE_PORT,
+                exc,
+            )
 
-    ctx = ServerContext(mcp=mcp, version=None, mock=mock)
+    ctx = ServerContext(mcp=mcp, version=version, mock=mock)
 
     read.register(ctx)
     graph.register(ctx)
@@ -58,6 +72,7 @@ def build_server(mock: bool = False) -> FastMCP:
     comp.register(ctx)
     expressions.register(ctx)
     roto.register(ctx)
+    digest.register(ctx)
 
     return mcp
 
