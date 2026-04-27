@@ -814,6 +814,11 @@ class MockNukeServer:
         # B7: scene_delta call log. Tests assert that on a no-change call
         # we returned the short-circuit path (no node enumeration).
         self.scene_delta_short_circuits: int = 0
+        # B2 async render: record render_async / cancel_render payloads
+        # so tests can assert the wire shape without observing the
+        # mock server's internal threading.
+        self.async_renders: list[dict] = []
+        self.cancelled_renders: list[str | None] = []
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -902,6 +907,8 @@ class MockNukeServer:
             "read_selected": self._read_selected,
             "execute_python": self._execute_python,
             "render": self._render,
+            "render_async": self._render_async,
+            "cancel_render": self._cancel_render,
             "save_script": self._save_script,
             "load_script": self._load_script,
             "set_frame_range": self._set_frame_range,
@@ -1135,6 +1142,18 @@ class MockNukeServer:
 
     def _render(self, p: dict) -> dict:
         return {"rendered": "Write1", "frames": [1001, 1100]}
+
+    def _render_async(self, p: dict) -> dict:
+        # Mock for B2 async render. Records the call so tests can
+        # assert the wire payload and returns the immediate ack
+        # without actually spawning a worker -- tests inject
+        # task_progress notifications via the notification queue.
+        self.async_renders.append(p)
+        return {"task_id": p.get("task_id"), "started": True}
+
+    def _cancel_render(self, p: dict) -> dict:
+        self.cancelled_renders.append(p.get("task_id"))
+        return {"cancelled": True, "task_id": p.get("task_id")}
 
     def _save_script(self, p: dict) -> dict:
         return {"saved": self.script_info["script"]}

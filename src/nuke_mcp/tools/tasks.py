@@ -13,10 +13,12 @@ swap the singleton via ``tasks.reset_default_store()`` + the
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any
 
+from nuke_mcp import connection
 from nuke_mcp import tasks as task_store
 from nuke_mcp.annotations import DESTRUCTIVE, READ_ONLY
 
@@ -89,17 +91,24 @@ def register(ctx: ServerContext) -> None:
     def tasks_cancel(id: str) -> dict:  # noqa: A002 - public API name
         """Cancel an in-flight task.
 
-        Sets ``state="cancelled"`` on the disk record. The addon-side
-        worker thread (B2 commit 4) checks the corresponding stop
-        event between frames and exits cleanly. Cancelling an
-        already-terminal task is a no-op -- the response carries the
-        existing state unchanged.
+        Sets ``state="cancelled"`` on the disk record AND signals the
+        addon-side worker (for renders) so it stops between frames.
+        Cancelling an already-terminal task is a no-op -- the response
+        carries the existing state unchanged.
 
         Args:
             id: 16-hex-char task id.
         """
         store = task_store.default_store()
         try:
+            existing = store.get(id)
+            if existing is None:
+                return {
+                    "status": "error",
+                    "error": f"task not found: {id}",
+                    "error_class": "TaskNotFound",
+                }
+            already_terminal = existing.state in task_store.TERMINAL_STATES
             task = store.cancel(id)
         except KeyError:
             return {
@@ -107,6 +116,20 @@ def register(ctx: ServerContext) -> None:
                 "error": f"task not found: {id}",
                 "error_class": "TaskNotFound",
             }
+
+        # Also signal the addon worker for in-flight renders. Send is
+        # best-effort: if the addon side already finished or the
+        # connection is gone, we still want the disk-side cancellation
+        # recorded. This stays below ``tasks_cancel``'s own timeout
+        # via the default ``read`` class.
+        if not already_terminal and task.tool == "render_frames":
+            with contextlib.suppress(Exception):
+                connection.send("cancel_render", task_id=id)
+            # Drop any registered notification listener so a stale
+            # progress line can't flip the state back to working.
+            with contextlib.suppress(Exception):
+                connection.notification_queue().unregister_listener(id)
+
         return _serialize(task)
 
     @ctx.mcp.tool(annotations=READ_ONLY, output_schema=None)

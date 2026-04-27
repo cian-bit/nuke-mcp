@@ -733,19 +733,24 @@ class _NotificationQueue:
     def put(self, notif: dict[str, Any]) -> None:
         """Route a notification to its listener or queue it.
 
-        Listener callbacks are invoked under the queue lock to keep
-        ordering deterministic. If a listener raises, the exception is
-        logged and the notification falls through to the queue so
-        callers can still inspect it via ``drain``.
+        Resolves the listener under the lock, then releases it before
+        invoking the callback. This lets a listener safely call
+        ``unregister_listener`` (or even ``register_listener``) on the
+        same queue without deadlocking on the non-reentrant lock. If
+        the listener raises, the exception is logged and the
+        notification falls through to the queue so callers can still
+        inspect it via ``drain``.
         """
+        notif_id = str(notif.get("id", ""))
         with self._lock:
-            cb = self._listeners.get(str(notif.get("id", "")))
-            if cb is not None:
-                try:
-                    cb(notif)
-                    return
-                except Exception:
-                    log.exception("task_progress listener raised; queueing instead")
+            cb = self._listeners.get(notif_id)
+        if cb is not None:
+            try:
+                cb(notif)
+                return
+            except Exception:
+                log.exception("task_progress listener raised; queueing instead")
+        with self._lock:
             self._queued.append(notif)
 
     def drain(self) -> list[dict[str, Any]]:

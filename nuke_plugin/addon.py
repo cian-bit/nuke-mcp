@@ -181,13 +181,16 @@ def _handle_client(client: socket.socket) -> None:
                     _send(client, {"status": "error", "error": "invalid json"})
                     continue
 
-                resp = _dispatch(msg)
+                resp = _dispatch(msg, client=client)
                 _send(client, resp)
 
         except TimeoutError:
             continue
         except OSError:
             break
+    # tear down per-socket helper state so a long-lived process
+    # doesn't accumulate dict entries across reconnects.
+    _drop_send_lock(client)
 
 
 # B7: per-request node-name -> nuke.Node cache. Stashed on threading.local
@@ -216,7 +219,7 @@ def _resolve_node(name: str) -> Any:
     return node
 
 
-def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
+def _dispatch(msg: dict[str, Any], client: socket.socket | None = None) -> dict[str, Any]:
     """Route a command to the right handler, executed on Nuke's main thread.
 
     A2: echoes ``_request_id`` from the top-level payload back in the
@@ -226,6 +229,11 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
     B7: installs a fresh per-request ``node_cache`` on ``_request_local``
     so handlers that touch the same node twice (or that participate in
     batch operations) avoid redundant ``nuke.toNode`` calls.
+
+    B2: ``render_async`` is special-cased -- it must NOT block on
+    ``executeInMainThreadWithResult`` because the whole point is to
+    return a task_id immediately and let a background worker emit
+    ``task_progress`` lines on the same socket.
     """
     import nuke
 
@@ -235,6 +243,40 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
 
     if cmd == "ping":
         resp = {"status": "ok", "result": {"pong": True}}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
+
+    # B2: async render returns immediately after spawning a worker.
+    if cmd == "render_async":
+        if client is None:
+            resp = {
+                "status": "error",
+                "error": "render_async requires the client socket",
+                "error_class": "ValueError",
+            }
+            if rid is not None:
+                resp["_request_id"] = rid
+            return resp
+        try:
+            result = _start_render_async(params, client)
+            resp = {"status": "ok", "result": result}
+        except Exception as e:
+            resp = {
+                "status": "error",
+                "error": str(e),
+                "error_class": type(e).__name__,
+                "traceback": traceback.format_exc(),
+            }
+            _watchdog.record_failure(cmd, rid, e)
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
+
+    if cmd == "cancel_render":
+        task_id = params.get("task_id")
+        cancelled = bool(task_id) and _cancel_active_render(str(task_id))
+        resp = {"status": "ok", "result": {"cancelled": cancelled, "task_id": task_id}}
         if rid is not None:
             resp["_request_id"] = rid
         return resp
@@ -283,9 +325,64 @@ def _json_safe(obj: Any) -> Any:
     return str(obj)
 
 
+# Per-socket write lock. The B2 async-render worker thread calls
+# ``_send`` from a background thread to emit ``task_progress`` lines
+# while the main loop may also be sending a response. ``sendall`` is
+# atomic for one buffer but two interleaved calls could fragment a
+# frame -- the lock keeps each call's bytes contiguous.
+_send_locks: dict[int, threading.Lock] = {}
+_send_locks_guard = threading.Lock()
+
+
+def _get_send_lock(sock: socket.socket) -> threading.Lock:
+    """Lazy per-socket write lock keyed on ``id(sock)``."""
+    with _send_locks_guard:
+        lock = _send_locks.get(id(sock))
+        if lock is None:
+            lock = threading.Lock()
+            _send_locks[id(sock)] = lock
+        return lock
+
+
+def _drop_send_lock(sock: socket.socket) -> None:
+    with _send_locks_guard:
+        _send_locks.pop(id(sock), None)
+
+
 def _send(sock: socket.socket, data: dict) -> None:
     payload = json.dumps(_json_safe(data), separators=(",", ":")).encode("utf-8")
-    sock.sendall(payload + b"\n")
+    with _get_send_lock(sock):
+        sock.sendall(payload + b"\n")
+
+
+# B2: active async-render registry. Keyed by task_id, value is a stop
+# event the worker checks between frames. ``cancel_render`` sets the
+# event; the worker exits cleanly and writes a final ``cancelled``
+# notification before tearing down.
+_active_renders: dict[str, threading.Event] = {}
+_active_renders_guard = threading.Lock()
+
+
+def _register_render(task_id: str) -> threading.Event:
+    stop = threading.Event()
+    with _active_renders_guard:
+        _active_renders[task_id] = stop
+    return stop
+
+
+def _unregister_render(task_id: str) -> None:
+    with _active_renders_guard:
+        _active_renders.pop(task_id, None)
+
+
+def _cancel_active_render(task_id: str) -> bool:
+    """Signal the worker for ``task_id`` to stop. Returns True if found."""
+    with _active_renders_guard:
+        stop = _active_renders.get(task_id)
+    if stop is None:
+        return False
+    stop.set()
+    return True
 
 
 # knobs to skip in output -- ui-only, never useful for comp analysis
@@ -823,6 +920,139 @@ def _handle_render(params: dict) -> dict:
 
     nuke.execute(node, first, last)
     return {"rendered": node.name(), "frames": [first, last]}
+
+
+# B2: async render. The worker thread iterates frames, calls
+# ``nuke.executeInMainThreadWithResult`` per frame so each frame stays
+# on the main thread, and emits ``task_progress`` notifications on
+# the live client socket between frames. A stop event registered at
+# spawn time lets ``cancel_render`` short-circuit the loop without
+# killing the thread (Python lacks safe thread-kill -- cooperative
+# cancellation is the only sane path).
+def _start_render_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the worker. Returns
+    immediately with the task_id so the caller can poll task status.
+    """
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("render_async requires task_id")
+    write_name = params.get("write_node")
+    frame_range = params.get("frame_range")
+
+    # Resolve frame range now (still on main thread via dispatch
+    # caller's executeInMainThreadWithResult... wait, no: render_async
+    # bypasses the main-thread dispatch path. We do the resolve inside
+    # the worker so any ``nuke.root()`` access stays on the main
+    # thread via executeInMainThreadWithResult.
+
+    stop_event = _register_render(str(task_id))
+    thread = threading.Thread(
+        target=_render_worker,
+        args=(str(task_id), write_name, frame_range, client, stop_event),
+        name=f"nuke-mcp-render-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _render_worker(
+    task_id: str,
+    write_name: str | None,
+    frame_range: list[int] | None,
+    client: socket.socket,
+    stop_event: threading.Event,
+) -> None:
+    """Background render loop.
+
+    Runs each frame's execute() through ``executeInMainThreadWithResult``
+    so Nuke's own main-thread invariant holds. After each frame emits a
+    ``task_progress`` notification; emits a final notification with
+    ``state`` set to ``completed`` / ``failed`` / ``cancelled`` so the
+    MCP-side listener can flip the TaskStore record without polling.
+    """
+    import nuke
+
+    def _resolve() -> tuple[Any, int, int]:
+        if write_name:
+            node = nuke.toNode(write_name)
+            if node is None:
+                raise ValueError(f"write node not found: {write_name}")
+        else:
+            writes = list(nuke.allNodes("Write"))
+            if not writes:
+                raise ValueError("no Write nodes in script")
+            node = writes[0]
+        if frame_range:
+            first, last = int(frame_range[0]), int(frame_range[1])
+        else:
+            first = int(nuke.root()["first_frame"].value())
+            last = int(nuke.root()["last_frame"].value())
+        return node, first, last
+
+    def _emit(payload: dict) -> None:
+        # Best-effort: a write failure means the client died; the
+        # worker exits next iteration when the addon notices the
+        # closed socket. No retry -- progress lines are lossy by
+        # design.
+        try:
+            _send(client, payload)
+        except OSError as exc:
+            log.warning("render_worker emit failed (task=%s): %s", task_id, exc)
+
+    try:
+        node, first, last = nuke.executeInMainThreadWithResult(_resolve)
+        node_name = nuke.executeInMainThreadWithResult(node.name)
+        total = last - first + 1
+        for offset, frame in enumerate(range(first, last + 1), start=1):
+            if stop_event.is_set():
+                _emit(
+                    {
+                        "type": "task_progress",
+                        "id": task_id,
+                        "state": "cancelled",
+                        "frame": frame - 1 if frame > first else first,
+                        "total": total,
+                    }
+                )
+                return
+            nuke.executeInMainThreadWithResult(nuke.execute, args=(node, frame, frame))
+            _emit(
+                {
+                    "type": "task_progress",
+                    "id": task_id,
+                    "state": "working",
+                    "frame": frame,
+                    "total": total,
+                    "progress": offset,
+                }
+            )
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "completed",
+                "frame": last,
+                "total": total,
+                "result": {"rendered": node_name, "frames": [first, last]},
+            }
+        )
+    except Exception as e:
+        log.exception("render_worker failed (task=%s)", task_id)
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "failed",
+                "error": {
+                    "error_class": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+        )
+    finally:
+        _unregister_render(task_id)
 
 
 def _handle_save_script(params: dict) -> dict:

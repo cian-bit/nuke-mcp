@@ -4,14 +4,24 @@ B5 wraps the addon's ``render`` reply through ``RenderResult`` -- the
 wire shape ``{rendered, frames}`` flows through the model, which adds
 typed accessors for ``frames_written`` / ``output_path`` while
 preserving the original keys via ``extra="allow"``.
+
+B2 turns ``render_frames`` into an MCP Task by default. The
+synchronous=True kwarg keeps the pre-B2 wire shape for callers that
+want a blocking render -- the back-compat tests run through that
+path. Async mode persists a Task record, sends ``render_async`` to
+the addon (which returns immediately after spawning a worker thread),
+and registers a notification listener that updates the Task as
+``task_progress`` lines arrive.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any
 
 from nuke_mcp import connection
+from nuke_mcp import tasks as task_store
 from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
 from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.models import RenderResult
@@ -27,6 +37,93 @@ log = logging.getLogger(__name__)
 def _model_dump(model: Any) -> dict[str, Any]:
     """``model_dump`` with the canonical B5 flag set."""
     return model.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
+
+
+def _on_progress(notif: dict[str, Any]) -> None:
+    """Notification listener that mirrors a ``task_progress`` line into
+    the TaskStore. Registered per-task at render-launch time and
+    unregistered on the terminal state.
+
+    The addon emits a ``state`` field on every notification (working,
+    completed, failed, cancelled). Terminal states get the ``result``
+    or ``error`` payload merged in. Non-terminal updates only bump the
+    ``progress`` dict so the operator can poll for live frame counts.
+    """
+    task_id = str(notif.get("id", ""))
+    if not task_id:
+        return
+    state = notif.get("state", "working")
+    store = task_store.default_store()
+    try:
+        existing = store.get(task_id)
+        if existing is None:
+            return
+        # Don't downgrade a terminal state -- if we already saw a
+        # ``completed`` line and a stragglers ``working`` line arrives,
+        # ignore the late one.
+        if existing.state in task_store.TERMINAL_STATES:
+            return
+
+        update_fields: dict[str, Any] = {}
+        if state == "working":
+            progress = {
+                "frame": notif.get("frame"),
+                "total": notif.get("total"),
+                "step": notif.get("progress"),
+            }
+            update_fields["progress"] = {k: v for k, v in progress.items() if v is not None}
+        elif state == "completed":
+            update_fields["state"] = "completed"
+            result = notif.get("result")
+            if isinstance(result, dict):
+                update_fields["result"] = result
+        elif state == "failed":
+            update_fields["state"] = "failed"
+            error = notif.get("error")
+            if isinstance(error, dict):
+                update_fields["error"] = error
+        elif state == "cancelled":
+            update_fields["state"] = "cancelled"
+        store.update(task_id, **update_fields)
+
+        if state in task_store.TERMINAL_STATES:
+            connection.notification_queue().unregister_listener(task_id)
+    except Exception:
+        log.exception("on_progress listener for task=%s failed", task_id)
+
+
+def _start_async_render(params: dict[str, Any]) -> dict[str, Any]:
+    """Create a Task, register a progress listener, dispatch to addon.
+
+    Returns immediately with the task_id and the initial ``working``
+    state. The addon's ``render_async`` handler returns a synchronous
+    ``{started: true}`` confirmation; subsequent frame progress flows
+    through the notification queue and ``_on_progress``.
+    """
+    store = task_store.default_store()
+    request_id = ""  # filled in by ``connection.send`` -- see below
+    task = store.create(tool="render_frames", params=dict(params), request_id=request_id)
+    queue = connection.notification_queue()
+    queue.register_listener(task.id, _on_progress)
+    try:
+        ack = connection.send("render_async", _class="render", task_id=task.id, **params)
+    except Exception as exc:
+        # Failed to even hand off to the addon -- mark the task failed
+        # so the operator's tasks_get reflects reality, then surface
+        # the original error.
+        queue.unregister_listener(task.id)
+        with contextlib.suppress(Exception):
+            store.update(
+                task.id,
+                state="failed",
+                error={"error_class": type(exc).__name__, "message": str(exc)},
+            )
+        raise
+    return {
+        "task_id": task.id,
+        "state": task.state,
+        "ack": ack,
+    }
 
 
 def register(ctx: ServerContext) -> None:
@@ -71,14 +168,27 @@ def register(ctx: ServerContext) -> None:
         first_frame: int | None = None,
         last_frame: int | None = None,
         confirm: bool = False,
+        synchronous: bool = False,
     ) -> dict:
         """Render frames through a Write node.
+
+        By default this returns immediately with a ``task_id`` and
+        runs the render in the background; poll ``tasks_get(task_id)``
+        for progress, ``tasks_cancel`` to interrupt, or wait for the
+        terminal state notification.
+
+        Pass ``synchronous=True`` to keep the pre-B2 blocking shape
+        (returns the full ``RenderResult`` once the render finishes).
+        That path is wire-compatible with existing callers.
 
         Args:
             write_node: name of Write node. uses first Write in script if omitted.
             first_frame: start frame. uses script range if omitted.
             last_frame: end frame. uses script range if omitted.
             confirm: must be True to render. call with False to preview.
+            synchronous: block until done and return ``RenderResult``
+                (B2 back-compat). Defaults to False -- use the async
+                Task flow.
         """
         if not confirm:
             msg = "will render"
@@ -93,22 +203,27 @@ def register(ctx: ServerContext) -> None:
             params["write_node"] = write_node
         if first_frame is not None and last_frame is not None:
             params["frame_range"] = [first_frame, last_frame]
-        # render = non-idempotent (writes frames). 900s class timeout
-        # via TIMEOUT_CLASSES["render"] -- removes the prior 300s magic
-        # number and routes the call through the same envelope as send().
-        result = connection.send("render", _class="render", **params)
-        if isinstance(result, dict) and "rendered" in result:
-            try:
-                return _model_dump(RenderResult.model_validate(result))
-            except Exception as exc:
-                warn_once(
-                    log,
-                    "render_frames",
-                    "render_frames: RenderResult validation failed; returning raw payload: %s",
-                    exc,
-                )
-                return result
-        return result
+
+        if synchronous:
+            # render = non-idempotent (writes frames). 900s class timeout
+            # via TIMEOUT_CLASSES["render"] -- removes the prior 300s magic
+            # number and routes the call through the same envelope as send().
+            result = connection.send("render", _class="render", **params)
+            if isinstance(result, dict) and "rendered" in result:
+                try:
+                    return _model_dump(RenderResult.model_validate(result))
+                except Exception as exc:
+                    warn_once(
+                        log,
+                        "render_frames",
+                        "render_frames: RenderResult validation failed; "
+                        "returning raw payload: %s",
+                        exc,
+                    )
+                    return result
+            return result
+
+        return _start_async_render(params)
 
     # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
     # ``destructiveHint=False`` so the schema explicitly marks it benign.

@@ -3,6 +3,10 @@
 A3 migrated ``setup_write`` to a typed addon handler with file_type +
 path-traversal allowlists. ``setup_precomp`` and ``list_precomps`` are
 out of A3 scope and still ship f-string ``execute_python`` payloads.
+
+B2 turns ``render_frames`` into an MCP Task by default. Existing
+synchronous-path tests use ``synchronous=True`` for back-compat; new
+tests cover the async dispatch + task_progress listener.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from typing import Any
 import pytest
 
 from nuke_mcp import connection
+from nuke_mcp import tasks as task_store
 from nuke_mcp.tools import render
 
 
@@ -224,12 +229,14 @@ def test_render_frames_preview_without_confirm(render_tools):
 
 
 def test_render_frames_with_confirm_calls_render(render_tools):
+    """Back-compat: ``synchronous=True`` keeps the pre-B2 wire shape."""
     server, _script, tools = render_tools
     result = tools["render_frames"](
         write_node="MainWrite",
         first_frame=1001,
         last_frame=1005,
         confirm=True,
+        synchronous=True,
     )
     assert result.get("rendered") == "Write1"
     assert result.get("frames") == [1001, 1100]
@@ -302,3 +309,153 @@ def test_list_precomps_disconnected(render_tools):
     connection.disconnect()
     result = tools["list_precomps"]()
     assert isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# B2: render_frames as a Task (async by default)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def render_tools_with_taskstore(render_tools, monkeypatch, tmp_path):
+    """``render_tools`` plus a clean per-test TaskStore.
+
+    Pinning ``NUKE_MCP_TASK_DIR`` per test keeps the suite isolated
+    from any real ``~/.nuke_mcp/tasks`` dir and from sibling tests.
+    """
+    monkeypatch.setenv("NUKE_MCP_TASK_DIR", str(tmp_path))
+    task_store.reset_default_store()
+    yield render_tools
+    task_store.reset_default_store()
+
+
+def test_render_frames_async_returns_task_id(render_tools_with_taskstore):
+    server, _script, tools = render_tools_with_taskstore
+    result = tools["render_frames"](
+        write_node="MainWrite",
+        first_frame=1001,
+        last_frame=1005,
+        confirm=True,
+    )
+    assert "task_id" in result
+    assert result["state"] == "working"
+    # The mock recorded the render_async call with the task_id forwarded.
+    assert len(server.async_renders) == 1
+    payload = server.async_renders[0]
+    assert payload["task_id"] == result["task_id"]
+    assert payload["frame_range"] == [1001, 1005]
+    assert payload["write_node"] == "MainWrite"
+    # The Task record exists on disk in the working state.
+    store = task_store.default_store()
+    task = store.get(result["task_id"])
+    assert task is not None
+    assert task.state == "working"
+    assert task.tool == "render_frames"
+
+
+def test_render_frames_async_progress_listener_updates_store(render_tools_with_taskstore):
+    server, _script, tools = render_tools_with_taskstore
+    out = tools["render_frames"](confirm=True)
+    task_id = out["task_id"]
+    queue = connection.notification_queue()
+
+    # Inject a progress-then-completion sequence as if the addon worker emitted them.
+    queue.put({"type": "task_progress", "id": task_id, "state": "working", "frame": 1, "total": 5})
+    queue.put({"type": "task_progress", "id": task_id, "state": "working", "frame": 3, "total": 5})
+    queue.put(
+        {
+            "type": "task_progress",
+            "id": task_id,
+            "state": "completed",
+            "frame": 5,
+            "total": 5,
+            "result": {"rendered": "Write1", "frames": [1, 5]},
+        }
+    )
+
+    store = task_store.default_store()
+    final = store.get(task_id)
+    assert final is not None
+    assert final.state == "completed"
+    assert final.result == {"rendered": "Write1", "frames": [1, 5]}
+
+
+def test_render_frames_async_failure_path(render_tools_with_taskstore):
+    server, _script, tools = render_tools_with_taskstore
+    out = tools["render_frames"](confirm=True)
+    task_id = out["task_id"]
+    queue = connection.notification_queue()
+    queue.put(
+        {
+            "type": "task_progress",
+            "id": task_id,
+            "state": "failed",
+            "error": {"error_class": "RuntimeError", "message": "boom"},
+        }
+    )
+    store = task_store.default_store()
+    task = store.get(task_id)
+    assert task is not None
+    assert task.state == "failed"
+    assert task.error == {"error_class": "RuntimeError", "message": "boom"}
+
+
+def test_render_frames_async_late_progress_does_not_revive_terminal(render_tools_with_taskstore):
+    """A stragglers ``working`` notification after ``completed`` must
+    NOT downgrade the task state -- the listener bails when the disk
+    record is already terminal.
+    """
+    server, _script, tools = render_tools_with_taskstore
+    out = tools["render_frames"](confirm=True)
+    task_id = out["task_id"]
+    queue = connection.notification_queue()
+    queue.put(
+        {
+            "type": "task_progress",
+            "id": task_id,
+            "state": "completed",
+            "result": {"rendered": "Write1", "frames": [1, 5]},
+        }
+    )
+    queue.put(
+        {"type": "task_progress", "id": task_id, "state": "working", "frame": 99, "total": 100}
+    )
+    store = task_store.default_store()
+    task = store.get(task_id)
+    assert task is not None
+    assert task.state == "completed"
+
+
+def test_tasks_cancel_signals_addon_for_render_task(render_tools_with_taskstore):
+    server, _script, tools = render_tools_with_taskstore
+    out = tools["render_frames"](confirm=True)
+    task_id = out["task_id"]
+
+    # Register the tasks_* tools on a separate stub so we can call them.
+    from nuke_mcp.tools import tasks as tasks_tools
+
+    ctx = _StubCtx()
+    tasks_tools.register(ctx)
+    cancelled = ctx.mcp.registered["tasks_cancel"](task_id)
+
+    assert cancelled["state"] == "cancelled"
+    # The addon-side cancel_render must have been dispatched.
+    assert task_id in server.cancelled_renders
+
+
+def test_render_frames_synchronous_wire_compat(render_tools_with_taskstore):
+    """Back-compat: ``synchronous=True`` MUST return the pre-B2 shape
+    (``rendered`` + ``frames``) so existing client code keeps working.
+    """
+    _server, _script, tools = render_tools_with_taskstore
+    out = tools["render_frames"](
+        write_node="MainWrite",
+        first_frame=1001,
+        last_frame=1005,
+        confirm=True,
+        synchronous=True,
+    )
+    # The RenderResult model fold-in adds ``frames_written`` /
+    # ``output_path`` but ``extra="allow"`` keeps the original keys.
+    assert out.get("rendered") == "Write1" or out.get("output_path") == "Write1"
+    assert "task_id" not in out
