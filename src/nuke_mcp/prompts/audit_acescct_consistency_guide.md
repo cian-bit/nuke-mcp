@@ -1,5 +1,5 @@
 ---
-name: audit_acescct_consistency
+name: audit_acescct_consistency_guide
 description: Guides the model through running the ACEScct consistency audit and interpreting findings (Read colorspaces, Write colorspaces, working space, OCIO config).
 arguments:
   - name: scope

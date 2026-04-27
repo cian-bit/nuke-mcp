@@ -42,7 +42,7 @@ EXPECTED_PROMPT_NAMES = {
     "build_stmap_distortion_envelope",
     "build_planar_track_clean_plate",
     "build_3d_camera_track_project",
-    "audit_acescct_consistency",
+    "audit_acescct_consistency_guide",
 }
 
 
