@@ -459,16 +459,16 @@ def _consume_pending_warning(result: Any) -> Any:
     """Merge any stashed crash-recovery warning into ``result`` once.
 
     Only merges when ``result`` is a dict (which is the convention for
-    every typed handler). For non-dict results we drop the warning
-    silently rather than reshape the response -- the warning is best-
-    effort context, not load-bearing data.
+    every typed handler). For non-dict results, keep the warning queued
+    for the next dict response rather than silently losing recovery
+    context.
     """
     global _pending_warning
     if _pending_warning is None:
         return result
-    pending = _pending_warning
-    _pending_warning = None
     if isinstance(result, dict):
+        pending = _pending_warning
+        _pending_warning = None
         merged = dict(result)
         for key, value in pending.items():
             merged.setdefault(key, value)

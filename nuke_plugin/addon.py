@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import socket
+import sys
 import threading
 import traceback
 from typing import Any
@@ -34,10 +35,15 @@ try:
     from . import _watchdog  # type: ignore[no-redef]
 except ImportError:
     _wd_path = pathlib.Path(__file__).with_name("_watchdog.py")
-    _wd_spec = importlib.util.spec_from_file_location("nuke_mcp_addon._watchdog", _wd_path)
-    assert _wd_spec is not None and _wd_spec.loader is not None
-    _watchdog = importlib.util.module_from_spec(_wd_spec)
-    _wd_spec.loader.exec_module(_watchdog)
+    _wd_name = "nuke_mcp_addon._watchdog"
+    if _wd_name in sys.modules:
+        _watchdog = sys.modules[_wd_name]
+    else:
+        _wd_spec = importlib.util.spec_from_file_location(_wd_name, _wd_path)
+        assert _wd_spec is not None and _wd_spec.loader is not None
+        _watchdog = importlib.util.module_from_spec(_wd_spec)
+        sys.modules[_wd_name] = _watchdog
+        _wd_spec.loader.exec_module(_watchdog)
 
 log = logging.getLogger("nuke_mcp.addon")
 

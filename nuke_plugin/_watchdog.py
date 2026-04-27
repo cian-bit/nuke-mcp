@@ -63,6 +63,7 @@ def _write_marker(payload: dict[str, Any]) -> None:
     ``connection.connect``.
     """
     target = marker_path()
+    tmp_path: str | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -78,6 +79,11 @@ def _write_marker(payload: dict[str, Any]) -> None:
         os.replace(tmp_path, target)
     except OSError:
         log.exception("watchdog: failed to write crash marker at %s", target)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                log.debug("watchdog: failed to remove temp marker %s", tmp_path)
 
 
 def record_failure(tool_name: str, request_id: str | None, exc: BaseException) -> None:

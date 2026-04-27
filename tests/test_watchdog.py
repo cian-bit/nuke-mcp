@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 import time
 
 import pytest
@@ -124,6 +125,28 @@ def test_marker_write_is_atomic(marker_dir, monkeypatch):
     assert marker.exists()
 
 
+def test_failed_marker_replace_removes_temp_file(marker_dir, monkeypatch):
+    """If os.replace fails, the temp marker is cleaned up."""
+
+    def fake_replace(_src, _dst):
+        raise PermissionError("destination is locked")
+
+    monkeypatch.setattr(_watchdog.os, "replace", fake_replace)
+
+    for i in range(3):
+        _watchdog.record_failure("op", f"rid-{i}", RuntimeError("x"))
+
+    leftovers = list(marker_dir.glob(".crash_marker.*.tmp"))
+    assert leftovers == []
+
+
+def test_addon_fallback_watchdog_module_is_singleton():
+    """The addon fallback registers _watchdog in sys.modules."""
+    module = sys.modules.get("nuke_mcp_addon._watchdog")
+    assert module is not None
+    assert module is sys.modules["nuke_mcp_addon._watchdog"]
+
+
 # ---------------------------------------------------------------------------
 # connection: marker pickup + warning injection
 # ---------------------------------------------------------------------------
@@ -209,3 +232,15 @@ def test_marker_missing_means_no_warning(marker_dir, mock_server):
         assert connection._pending_warning is None
     finally:
         connection.disconnect()
+
+
+def test_non_dict_response_does_not_consume_pending_warning(marker_dir):
+    """A scalar/list result cannot carry a warning, so replay it later."""
+    connection._pending_warning = {"warning": "session lost", "last_request_id": "rid"}
+    assert connection._consume_pending_warning(["not", "a", "dict"]) == ["not", "a", "dict"]
+    assert connection._pending_warning is not None
+
+    merged = connection._consume_pending_warning({"ok": True})
+    assert merged["warning"] == "session lost"
+    assert merged["last_request_id"] == "rid"
+    assert connection._pending_warning is None
