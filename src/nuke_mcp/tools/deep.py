@@ -3,7 +3,7 @@
 C1 atomic primitives for DeepRecolor, DeepMerge, DeepHoldout,
 DeepTransform, and DeepToImage. Mirrors the pattern in ``tracking.py``:
 every tool dispatches to a typed addon handler via ``run_on_main`` and
-returns a flat ``NodeRef`` (``{name, class, xpos, ypos, inputs}``).
+returns a flat ``NodeRef`` (``{name, type, x, y, inputs}``).
 
 Idempotency: when ``name=`` is supplied AND a node of the same class
 with matching inputs exists at that name, the addon returns the

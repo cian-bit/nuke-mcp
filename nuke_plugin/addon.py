@@ -1512,7 +1512,7 @@ def _handle_scene_delta(params: dict) -> dict:
 # Atomic primitives for camera-tracker, planar tracker, Tracker4 and the
 # bake operations; plus the deep-comp primitives (DeepRecolor / DeepMerge
 # / DeepHoldout / DeepTransform / DeepToImage). All handlers return a
-# flat ``NodeRef`` -- ``{name, class, xpos, ypos, inputs}`` -- so callers
+# flat ``NodeRef`` -- ``{name, type, x, y, inputs}`` -- so callers
 # never have to follow up with a separate ``get_node_info`` round-trip.
 #
 # Idempotency: when ``name`` is supplied AND a node of the same class
@@ -1535,12 +1535,17 @@ def _node_inputs(node: Any) -> list[str | None]:
 
 
 def _node_ref(node: Any) -> dict[str, Any]:
-    """Return the standard NodeRef shape for one Nuke node."""
+    """Return the standard NodeRef shape for one Nuke node.
+
+    Wire keys match the existing addon convention used by
+    ``_handle_read_node_detail`` and ``_handle_list_nodes`` (``type``/``x``/``y``)
+    rather than Python attribute names (``Class``/``xpos``/``ypos``).
+    """
     return {
         "name": node.name(),
-        "class": node.Class(),
-        "xpos": int(node.xpos()),
-        "ypos": int(node.ypos()),
+        "type": node.Class(),
+        "x": int(node.xpos()),
+        "y": int(node.ypos()),
         "inputs": _node_inputs(node),
     }
 

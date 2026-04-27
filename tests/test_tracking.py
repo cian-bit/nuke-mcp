@@ -128,7 +128,7 @@ def test_setup_camera_tracker_happy_path(tracking_tools):
     result = tools["setup_camera_tracker"]("plate")
     assert isinstance(result, dict)
     assert result.get("status") != "error"
-    assert result["class"] == "CameraTracker"
+    assert result["type"] == "CameraTracker"
     assert "plate" in result["inputs"]
     cmd, params = server.typed_calls[0]
     assert cmd == "setup_camera_tracker"
@@ -180,7 +180,7 @@ def test_setup_camera_tracker_rejects_bad_solve_method(tracking_tools):
 def test_setup_planar_tracker_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["setup_planar_tracker"]("plate", "plane_roto")
-    assert result["class"] == "PlanarTrackerNode"
+    assert result["type"] == "PlanarTrackerNode"
     assert result["inputs"][:2] == ["plate", "plane_roto"]
     _cmd, params = server.typed_calls[0]
     assert params["input_node"] == "plate"
@@ -211,7 +211,7 @@ def test_setup_planar_tracker_missing_input(tracking_tools):
 def test_setup_tracker4_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["setup_tracker4"]("plate", num_tracks=6)
-    assert result["class"] == "Tracker4"
+    assert result["type"] == "Tracker4"
     assert result["inputs"] == ["plate"]
     _cmd, params = server.typed_calls[0]
     assert params["num_tracks"] == 6
@@ -238,7 +238,7 @@ def test_setup_tracker4_rejects_bad_num_tracks(tracking_tools):
 def test_bake_tracker_to_corner_pin_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["bake_tracker_to_corner_pin"]("existing_tracker", ref_frame=1010)
-    assert result["class"] == "CornerPin2D"
+    assert result["type"] == "CornerPin2D"
     assert result["inputs"] == ["existing_tracker"]
     _cmd, params = server.typed_calls[0]
     assert params["tracker_node"] == "existing_tracker"
@@ -268,7 +268,7 @@ def test_bake_tracker_to_corner_pin_unknown_tracker(tracking_tools):
 def test_solve_3d_camera_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["solve_3d_camera"]("existing_camtrack")
-    assert result["class"] == "CameraTracker"
+    assert result["type"] == "CameraTracker"
     assert result["name"] == "existing_camtrack"
     _cmd, params = server.typed_calls[0]
     assert params["camera_tracker_node"] == "existing_camtrack"
@@ -294,7 +294,7 @@ def test_solve_3d_camera_unknown_node(tracking_tools):
 def test_bake_camera_to_card_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["bake_camera_to_card"]("existing_camtrack", frame=1024)
-    assert result["class"] == "Card3D"
+    assert result["type"] == "Card3D"
     assert result["inputs"] == ["existing_camtrack"]
     _cmd, params = server.typed_calls[0]
     assert params["camera_node"] == "existing_camtrack"

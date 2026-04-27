@@ -113,7 +113,7 @@ def test_create_deep_recolor_happy_path(deep_tools):
     result = tools["create_deep_recolor"]("deepA", "beauty")
     assert isinstance(result, dict)
     assert result.get("status") != "error"
-    assert result["class"] == "DeepRecolor"
+    assert result["type"] == "DeepRecolor"
     assert result["inputs"][:2] == ["deepA", "beauty"]
     cmd, params = server.typed_calls[0]
     assert cmd == "create_deep_recolor"
@@ -151,7 +151,7 @@ def test_create_deep_recolor_unknown_color_node(deep_tools):
 def test_create_deep_merge_happy_path(deep_tools):
     server, _script, tools = deep_tools
     result = tools["create_deep_merge"]("deepA", "deepB")
-    assert result["class"] == "DeepMerge"
+    assert result["type"] == "DeepMerge"
     assert result["inputs"][:2] == ["deepA", "deepB"]
     _cmd, params = server.typed_calls[0]
     assert params["op"] == "over"
@@ -160,7 +160,7 @@ def test_create_deep_merge_happy_path(deep_tools):
 def test_create_deep_merge_holdout_op(deep_tools):
     server, _script, tools = deep_tools
     result = tools["create_deep_merge"]("deepA", "deepB", op="holdout")
-    assert result["class"] == "DeepMerge"
+    assert result["type"] == "DeepMerge"
     _cmd, params = server.typed_calls[0]
     assert params["op"] == "holdout"
 
@@ -195,7 +195,7 @@ def test_create_deep_merge_unknown_input(deep_tools):
 def test_create_deep_holdout_happy_path(deep_tools):
     server, _script, tools = deep_tools
     result = tools["create_deep_holdout"]("deepA", "holdoutDeep")
-    assert result["class"] == "DeepHoldout"
+    assert result["type"] == "DeepHoldout"
     assert result["inputs"][:2] == ["deepA", "holdoutDeep"]
     cmd, params = server.typed_calls[0]
     assert cmd == "create_deep_holdout"
@@ -226,7 +226,7 @@ def test_create_deep_holdout_unknown_subject(deep_tools):
 def test_create_deep_transform_happy_path(deep_tools):
     server, _script, tools = deep_tools
     result = tools["create_deep_transform"]("deepA", translate=(1.0, 2.0, 3.0))
-    assert result["class"] == "DeepTransform"
+    assert result["type"] == "DeepTransform"
     assert result["inputs"] == ["deepA"]
     _cmd, params = server.typed_calls[0]
     assert params["translate"] == [1.0, 2.0, 3.0]
@@ -262,7 +262,7 @@ def test_create_deep_transform_unknown_input(deep_tools):
 def test_deep_to_image_happy_path(deep_tools):
     server, _script, tools = deep_tools
     result = tools["deep_to_image"]("deepA")
-    assert result["class"] == "DeepToImage"
+    assert result["type"] == "DeepToImage"
     assert result["inputs"] == ["deepA"]
     cmd, params = server.typed_calls[0]
     assert cmd == "deep_to_image"

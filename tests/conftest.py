@@ -1486,9 +1486,9 @@ class MockNukeServer:
         data = self.nodes[name]
         return {
             "name": name,
-            "class": data["type"],
-            "xpos": int(data.get("x", 0)),
-            "ypos": int(data.get("y", 0)),
+            "type": data["type"],
+            "x": int(data.get("x", 0)),
+            "y": int(data.get("y", 0)),
             "inputs": list(self.connections.get(name, [])),
         }
 

@@ -8,7 +8,7 @@ Every tool is a thin dispatch to a typed addon handler via
 addon-side handler runs on Nuke's main thread, validates inputs,
 short-circuits on idempotent re-calls (``name=`` kwarg matched against
 existing class+inputs+name), and returns a flat ``NodeRef`` dict
-(``{name, class, xpos, ypos, inputs}``).
+(``{name, type, x, y, inputs}``).
 
 Idempotency contract: when ``name=`` is supplied AND a node of the same
 class with matching inputs already exists at that name, the addon
