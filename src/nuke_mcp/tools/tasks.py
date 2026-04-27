@@ -117,14 +117,22 @@ def register(ctx: ServerContext) -> None:
                 "error_class": "TaskNotFound",
             }
 
-        # Also signal the addon worker for in-flight renders. Send is
-        # best-effort: if the addon side already finished or the
-        # connection is gone, we still want the disk-side cancellation
-        # recorded. This stays below ``tasks_cancel``'s own timeout
-        # via the default ``read`` class.
-        if not already_terminal and task.tool == "render_frames":
+        # Also signal the addon worker for in-flight renders + Task-
+        # wrapped CopyCat / Cattery tools (C7). Send is best-effort:
+        # if the addon side already finished or the connection is
+        # gone, we still want the disk-side cancellation recorded.
+        # This stays below ``tasks_cancel``'s own timeout via the
+        # default ``read`` class.
+        _CANCEL_DISPATCH: dict[str, str] = {
+            "render_frames": "cancel_render",
+            "train_copycat": "cancel_copycat",
+            "setup_dehaze_copycat": "cancel_copycat",
+            "install_cattery_model": "cancel_install",
+        }
+        cancel_cmd = _CANCEL_DISPATCH.get(task.tool)
+        if not already_terminal and cancel_cmd is not None:
             with contextlib.suppress(Exception):
-                connection.send("cancel_render", task_id=id)
+                connection.send(cancel_cmd, task_id=id)
             # Drop any registered notification listener so a stale
             # progress line can't flip the state back to working.
             with contextlib.suppress(Exception):

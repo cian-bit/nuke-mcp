@@ -28,6 +28,7 @@ from nuke_mcp.tools import (
     expressions,
     graph,
     knobs,
+    ml,
     read,
     render,
     roto,
@@ -88,6 +89,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     digest.register(ctx)
     tracking.register(ctx)
     deep.register(ctx)
+    ml.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 
