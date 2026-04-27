@@ -35,6 +35,7 @@ _GATES: tuple[tuple[str, float], ...] = (
     ("tools/viewer.py", 80.0),
     ("tools/tracking.py", 0.0),
     ("tools/deep.py", 0.0),
+    ("tools/audit.py", 80.0),
     ("tools/digest.py", 85.0),
     ("connection.py", 85.0),
     ("tools/_helpers.py", 75.0),
