@@ -24,6 +24,7 @@ State machine, lifted from the MCP spec:
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import json
 import logging
@@ -251,6 +252,41 @@ class TaskStore:
         if existing.state in TERMINAL_STATES:
             return existing
         return self.update(task_id, state="cancelled")
+
+    def sweep_stale_working(self, max_age_seconds: float = 600.0) -> builtins.list[Task]:
+        """Mark working/input_required tasks older than ``max_age_seconds``
+        as failed with a ``SessionLost`` error. Returns the affected tasks.
+
+        Used on reconnect: a task left in ``working`` from before the
+        MCP server died can never finish (the addon-side worker is
+        gone), so flipping it to ``failed`` keeps ``tasks_list`` from
+        showing zombie records. The 10-minute default mirrors the
+        crash-marker freshness window in ``connection.py``.
+        """
+        now = time.time()
+        flipped: list[Task] = []
+        for task in self.list():
+            if task.state not in {"working", "input_required"}:
+                continue
+            if now - task.updated_at < max_age_seconds:
+                continue
+            try:
+                updated = self.update(
+                    task.id,
+                    state="failed",
+                    error={
+                        "error_class": "SessionLost",
+                        "message": (
+                            f"task in {task.state} state for "
+                            f"{int(now - task.updated_at)}s -- session lost before completion"
+                        ),
+                    },
+                )
+                flipped.append(updated)
+            except KeyError:
+                # Race: someone else deleted the file between list and update.
+                continue
+        return flipped
 
     def purge_completed_older_than(self, seconds: float = 86400.0) -> int:
         """Delete terminal-state tasks whose ``updated_at`` is older than

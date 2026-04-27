@@ -690,3 +690,39 @@ def test_disconnect_clears_recv_buffer(mock_server):
     connection._recv_buffers[sid] = b"leftover"
     connection.disconnect()
     assert sid not in connection._recv_buffers
+
+
+# -- B2 commit 5: stale-task sweep on reconnect --
+
+
+def test_connect_flips_stale_working_tasks_to_failed(mock_server, monkeypatch, tmp_path):
+    """A task stuck in ``working`` from a prior session must be marked
+    failed with ``SessionLost`` when the next connect() runs.
+    """
+    import time as _time
+
+    from nuke_mcp import tasks as task_store
+
+    monkeypatch.setenv("NUKE_MCP_TASK_DIR", str(tmp_path))
+    task_store.reset_default_store()
+    try:
+        store = task_store.default_store()
+        # Plant a stale working record.
+        task = store.create(tool="render_frames", params={}, request_id="r1")
+        obj = store.get(task.id)
+        assert obj is not None
+        backdated = {**obj.model_dump(mode="json"), "updated_at": _time.time() - 99999}
+        store._atomic_write(store._path(task.id), backdated)
+
+        _, port = mock_server
+        connection.connect("localhost", port)
+        try:
+            updated = store.get(task.id)
+            assert updated is not None
+            assert updated.state == "failed"
+            assert updated.error is not None
+            assert updated.error["error_class"] == "SessionLost"
+        finally:
+            connection.disconnect()
+    finally:
+        task_store.reset_default_store()

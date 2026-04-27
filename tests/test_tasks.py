@@ -165,3 +165,74 @@ def test_default_store_singleton(monkeypatch, tmp_path):
     tasks.reset_default_store()
     c = tasks.default_store()
     assert c is not a
+
+
+# ---------------------------------------------------------------------------
+# B2 commit 5: stale-working sweep
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_stale_working_flips_old_tasks_to_failed(store):
+    """A task stuck in ``working`` past the cutoff must be marked failed."""
+    fresh = store.create(tool="render_frames", params={}, request_id="r1")
+    stale = store.create(tool="render_frames", params={}, request_id="r2")
+    # Backdate the stale one by 11 minutes (cutoff is 10 by default).
+    obj = store.get(stale.id)
+    assert obj is not None
+    backdated = {**obj.model_dump(mode="json"), "updated_at": time.time() - 660}
+    store._atomic_write(store._path(stale.id), backdated)
+
+    flipped = store.sweep_stale_working()
+    assert len(flipped) == 1
+    assert flipped[0].id == stale.id
+    assert flipped[0].state == "failed"
+    assert flipped[0].error is not None
+    assert flipped[0].error.get("error_class") == "SessionLost"
+
+    # Fresh task untouched.
+    assert store.get(fresh.id).state == "working"  # type: ignore[union-attr]
+
+
+def test_sweep_stale_working_skips_terminal_states(store):
+    """Completed / failed / cancelled tasks are not affected by the sweep."""
+    completed = store.create(tool="render_frames", params={}, request_id="r1")
+    store.update(completed.id, state="completed")
+    cancelled = store.create(tool="render_frames", params={}, request_id="r2")
+    store.update(cancelled.id, state="cancelled")
+    # Backdate both well past the cutoff.
+    for tid in (completed.id, cancelled.id):
+        obj = store.get(tid)
+        assert obj is not None
+        backdated = {**obj.model_dump(mode="json"), "updated_at": time.time() - 99999}
+        store._atomic_write(store._path(tid), backdated)
+
+    flipped = store.sweep_stale_working()
+    assert flipped == []
+    # Terminal states preserved.
+    assert store.get(completed.id).state == "completed"  # type: ignore[union-attr]
+    assert store.get(cancelled.id).state == "cancelled"  # type: ignore[union-attr]
+
+
+def test_sweep_stale_working_ignores_fresh_records(store):
+    """Working tasks newer than the cutoff stay working."""
+    fresh = store.create(tool="render_frames", params={}, request_id="r1")
+    flipped = store.sweep_stale_working(max_age_seconds=600.0)
+    assert flipped == []
+    assert store.get(fresh.id).state == "working"  # type: ignore[union-attr]
+
+
+def test_sweep_stale_working_custom_cutoff(store):
+    """A tighter cutoff catches tasks that the default 10-minute one would miss."""
+    task = store.create(tool="render_frames", params={}, request_id="r1")
+    # Backdate to 30 seconds ago.
+    obj = store.get(task.id)
+    assert obj is not None
+    backdated = {**obj.model_dump(mode="json"), "updated_at": time.time() - 30}
+    store._atomic_write(store._path(task.id), backdated)
+
+    # Default cutoff (600s) leaves it alone.
+    assert store.sweep_stale_working() == []
+    # 10s cutoff catches it.
+    flipped = store.sweep_stale_working(max_age_seconds=10.0)
+    assert len(flipped) == 1
+    assert flipped[0].state == "failed"

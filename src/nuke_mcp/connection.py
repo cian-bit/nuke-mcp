@@ -293,11 +293,30 @@ def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
     log.info("connected to %s on %s:%d", version, host, port)
 
     _consume_crash_marker()
+    _sweep_stale_tasks()
 
     if _heartbeat_enabled():
         _start_heartbeat()
 
     return version
+
+
+def _sweep_stale_tasks() -> None:
+    """B2 commit 5: flip orphaned ``working`` tasks to ``failed`` on reconnect.
+
+    Imports inline to avoid a circular at module-import time
+    (``connection`` is imported by ``tasks`` indirectly via the tools
+    package). Best-effort: a sweep failure must not prevent connect()
+    from returning.
+    """
+    try:
+        from nuke_mcp import tasks as task_store
+
+        flipped = task_store.default_store().sweep_stale_working()
+        if flipped:
+            log.warning("session-lost sweep flipped %d stale tasks to failed", len(flipped))
+    except Exception:
+        log.exception("stale-task sweep failed; continuing")
 
 
 def disconnect() -> None:
