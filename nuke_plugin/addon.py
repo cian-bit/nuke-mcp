@@ -2077,6 +2077,277 @@ def _handle_bake_camera_to_card(params: dict) -> dict:
     return _node_ref(card)
 
 
+# ---------------------------------------------------------------------------
+# C5 workflow macros
+#
+# These compose the C1 atomic primitives above into a multi-node graph
+# wrapped in a Group. The macro never reimplements tracker creation --
+# it dispatches into the corresponding ``_handle_setup_*`` /
+# ``_handle_bake_*`` / ``_handle_solve_*`` handlers and wires the
+# returned NodeRefs into a Group.
+# ---------------------------------------------------------------------------
+
+
+_SURFACE_TYPES = frozenset({"planar", "3d"})
+
+
+def _derive_shot_tag() -> str:
+    """Derive a Group-name suffix from ``$SS_SHOT`` or the script path.
+
+    Order:
+      1. ``$SS_SHOT`` env var (the Salt Spill / FMP convention).
+      2. Stem of ``nuke.root().name()`` -- e.g. ``ss_shot0170_v003.nk``
+         -> ``ss_shot0170_v003``.
+      3. ``unsaved`` if neither is available (root has no name yet).
+
+    The result is sanitised so the Group name is always a valid Nuke
+    identifier: only ``[A-Za-z0-9_]`` survives, anything else collapses
+    to ``_``. An empty result falls through to ``unsaved``.
+    """
+    import nuke
+
+    raw = os.environ.get("SS_SHOT") or ""
+    if not raw:
+        try:
+            script_path = nuke.root().name() or ""
+        except Exception:
+            script_path = ""
+        if script_path:
+            raw = pathlib.Path(script_path).stem
+    if not raw:
+        raw = "unsaved"
+    cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in raw)
+    return cleaned or "unsaved"
+
+
+def _group_name_for_patch(explicit: str | None) -> str:
+    """Pick the Group name for a spaceship patch macro call."""
+    if explicit:
+        return explicit
+    return f"SpaceshipPatch_{_derive_shot_tag()}"
+
+
+def _handle_setup_spaceship_track_patch(params: dict) -> dict:
+    """Build a tracked-patch graph wrapped in a SpaceshipPatch_<shot> Group.
+
+    Composes the C1 primitives:
+
+    * ``planar`` branch: Roto plane -> setup_planar_tracker ->
+      bake_tracker_to_corner_pin -> RotoPaint (or supplied
+      ``patch_source``) -> CornerPin2D restore.
+    * ``3d`` branch: setup_camera_tracker -> solve_3d_camera ->
+      bake_camera_to_card -> Project3D -> ScanlineRender -> Merge2 over.
+
+    Idempotent on ``name=`` -- a re-call where a Group of that name
+    already exists short-circuits to the existing Group's NodeRef.
+    """
+    import nuke
+
+    plate_name = params["plate"]
+    ref_frame = int(params["ref_frame"])
+    surface_type = params.get("surface_type", "planar")
+    patch_source = params.get("patch_source")
+    explicit_name = params.get("name")
+
+    if surface_type not in _SURFACE_TYPES:
+        raise ValueError(f"invalid surface_type: {surface_type!r} (expected 'planar' or '3d')")
+
+    plate = _resolve_node(plate_name)
+    if plate is None:
+        raise ValueError(f"plate node not found: {plate_name}")
+
+    if patch_source is not None and _resolve_node(patch_source) is None:
+        raise ValueError(f"patch_source node not found: {patch_source}")
+
+    group_name = _group_name_for_patch(explicit_name)
+
+    # Idempotent re-call: a Group of this name already exists, return it.
+    existing = nuke.toNode(group_name)
+    if existing is not None:
+        if existing.Class() != "Group":
+            raise ValueError(
+                f"node '{group_name}' exists but is class '{existing.Class()}', " "expected 'Group'"
+            )
+        return _node_ref(existing)
+
+    # Build sub-graph at module scope (we move nodes into the Group at
+    # the end via Group ``.script`` round-trip is not necessary --
+    # ``nuke.nodes.Group()`` plus inner-node creation while the group
+    # context is open is the clean path).
+    group = nuke.nodes.Group()
+    group.setName(group_name)
+
+    members: list[str] = []
+    try:
+        group.begin()
+
+        # Every Group's input plate appears as an Input node inside the
+        # group context. The outer ``setInput(0, plate)`` below wires
+        # the Group's external input pipe to the plate.
+        group_input = nuke.nodes.Input()
+        group_input.setName("plate_in")
+
+        if surface_type == "planar":
+            # Roto plane (driven by the user post-creation; here we
+            # seed an empty RotoPaint stand-in, since PlanarTracker
+            # accepts Roto / RotoPaint.
+            roto_plane = nuke.nodes.Roto()
+            roto_plane.setInput(0, group_input)
+            roto_plane.setName(f"{group_name}_plane")
+            members.append(roto_plane.name())
+
+            # Compose: setup_planar_tracker
+            planar = _handle_setup_planar_tracker(
+                {
+                    "input_node": group_input.name(),
+                    "plane_roto": roto_plane.name(),
+                    "ref_frame": ref_frame,
+                    "name": f"{group_name}_planar",
+                }
+            )
+            members.append(planar["name"])
+
+            # Compose: bake_tracker_to_corner_pin (forward pin)
+            forward_pin = _handle_bake_tracker_to_corner_pin(
+                {
+                    "tracker_node": planar["name"],
+                    "ref_frame": ref_frame,
+                    "name": f"{group_name}_pinFwd",
+                }
+            )
+            members.append(forward_pin["name"])
+
+            # Patch source: user-supplied node OR a default RotoPaint
+            # clone fed by the forward pin.
+            if patch_source is not None:
+                patch_node = nuke.toNode(patch_source)
+                if patch_node is None:
+                    raise ValueError(f"patch_source vanished mid-build: {patch_source}")
+                patch_root_name = patch_node.name()
+            else:
+                rp = nuke.nodes.RotoPaint()
+                rp.setInput(0, nuke.toNode(forward_pin["name"]))
+                rp.setName(f"{group_name}_paint")
+                patch_root_name = rp.name()
+            members.append(patch_root_name)
+
+            # Restore-perspective CornerPin: a second CornerPin2D fed by
+            # the patch source, reversing the forward pin so the painted
+            # patch sits back in plate space.
+            pin_node = nuke.toNode(forward_pin["name"])
+            patch_node = nuke.toNode(patch_root_name)
+            restore_pin = nuke.nodes.CornerPin2D()
+            restore_pin.setInput(0, patch_node)
+            if restore_pin.knob("reference_frame"):
+                with contextlib.suppress(Exception):
+                    restore_pin["reference_frame"].setValue(ref_frame)
+            if restore_pin.knob("invert"):
+                with contextlib.suppress(Exception):
+                    restore_pin["invert"].setValue(True)
+            restore_pin.setName(f"{group_name}_pinRestore")
+            members.append(restore_pin.name())
+
+            output_input: Any = restore_pin
+            _ = pin_node  # forward pin lives in the chain; not the output
+
+        else:  # surface_type == "3d"
+            # Compose: setup_camera_tracker
+            camtrack = _handle_setup_camera_tracker(
+                {
+                    "input_node": group_input.name(),
+                    "name": f"{group_name}_camTrack",
+                }
+            )
+            members.append(camtrack["name"])
+
+            # Compose: solve_3d_camera
+            solved = _handle_solve_3d_camera(
+                {
+                    "camera_tracker_node": camtrack["name"],
+                    "name": f"{group_name}_camTrack",
+                }
+            )
+            members.append(solved["name"])
+
+            # Compose: bake_camera_to_card
+            card = _handle_bake_camera_to_card(
+                {
+                    "camera_node": solved["name"],
+                    "frame": ref_frame,
+                    "name": f"{group_name}_card",
+                }
+            )
+            members.append(card["name"])
+
+            # Patch source: user-supplied OR a default RotoPaint upstream
+            # of the Project3D so the artist has somewhere to paint.
+            if patch_source is not None:
+                patch_node = nuke.toNode(patch_source)
+                if patch_node is None:
+                    raise ValueError(f"patch_source vanished mid-build: {patch_source}")
+                patch_root_name = patch_node.name()
+            else:
+                rp = nuke.nodes.RotoPaint()
+                rp.setInput(0, group_input)
+                rp.setName(f"{group_name}_paint")
+                patch_root_name = rp.name()
+            members.append(patch_root_name)
+
+            # Project3D fed by patch source; second input is the
+            # solved camera (CameraTracker exposes a camera output).
+            project = nuke.nodes.Project3D()
+            project.setInput(0, nuke.toNode(patch_root_name))
+            project.setInput(1, nuke.toNode(solved["name"]))
+            project.setName(f"{group_name}_project3D")
+            members.append(project.name())
+
+            # ScanlineRender takes (obj=card3d_with_projection, cam=solved)
+            # then we Merge over plate.
+            #
+            # Wire: card receives the Project3D as its 'img' projection
+            # via setInput(1, project3D). Card3D inputs in Nuke 15 are
+            # input 0 = unused (in some builds) / image, input 1 = camera
+            # for projection. Wiring is best-effort via setInput; the
+            # macro stays robust by guarding with contextlib.suppress so
+            # a build-mismatch doesn't break the Group construction.
+            card_node = nuke.toNode(card["name"])
+            with contextlib.suppress(Exception):
+                card_node.setInput(0, project)
+
+            scanline = nuke.nodes.ScanlineRender()
+            scanline.setInput(1, card_node)
+            scanline.setInput(2, nuke.toNode(solved["name"]))
+            scanline.setName(f"{group_name}_scanline")
+            members.append(scanline.name())
+
+            merge = nuke.nodes.Merge2()
+            if merge.knob("operation"):
+                with contextlib.suppress(Exception):
+                    merge["operation"].setValue("over")
+            merge.setInput(0, group_input)  # A pipe = bg = plate
+            merge.setInput(1, scanline)  # B pipe = fg = rendered patch
+            merge.setName(f"{group_name}_merge")
+            members.append(merge.name())
+
+            output_input = merge
+
+        # Group output node closes off the internal graph.
+        group_output = nuke.nodes.Output()
+        group_output.setInput(0, output_input)
+    finally:
+        with contextlib.suppress(Exception):
+            group.end()
+
+    # Wire the Group's external input to the plate.
+    group.setInput(0, plate)
+    group.setXYpos(plate.xpos(), plate.ypos() + 80)
+
+    ref = _node_ref(group)
+    ref["surface_type"] = surface_type
+    ref["members"] = members
+    return ref
+
+
 def _handle_create_deep_recolor(params: dict) -> dict:
     """Create a DeepRecolor fed by deep input + colour input."""
     import nuke
@@ -2300,6 +2571,8 @@ HANDLERS: dict[str, Any] = {
     "bake_tracker_to_corner_pin": _handle_bake_tracker_to_corner_pin,
     "solve_3d_camera": _handle_solve_3d_camera,
     "bake_camera_to_card": _handle_bake_camera_to_card,
+    # C5 tracking workflow macros (compose the C1 primitives above).
+    "setup_spaceship_track_patch": _handle_setup_spaceship_track_patch,
     # C1 deep primitives
     "create_deep_recolor": _handle_create_deep_recolor,
     "create_deep_merge": _handle_create_deep_merge,

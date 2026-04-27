@@ -33,6 +33,7 @@ from nuke_mcp.tools import (
     roto,
     script,
     tasks,
+    track_workflow,
     tracking,
     viewer,
 )
@@ -87,6 +88,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     roto.register(ctx)
     digest.register(ctx)
     tracking.register(ctx)
+    track_workflow.register(ctx)
     deep.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
