@@ -21,6 +21,7 @@ from nuke_mcp import connection
 from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
 from nuke_mcp.tools import (
     aov,
+    audit,
     channels,
     code,
     color,
@@ -100,6 +101,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     distortion.register(ctx)
     deep_workflow.register(ctx)
     ml.register(ctx)
+    audit.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 

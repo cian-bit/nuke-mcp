@@ -158,6 +158,17 @@ PROFILES: dict[str, list[str]] = {
         "list_cattery_models",
         "install_cattery_model",
     ],
+    # C9 audit + QC tools. Read-only scans plus one BENIGN_NEW QC
+    # builder (qc_viewer_pair). audit_acescct_consistency is the C2
+    # colour module's owned slot; the wrapper here delegates when C2
+    # is present and returns a degraded payload otherwise.
+    "audit": [
+        "audit_acescct_consistency",
+        "audit_write_paths",
+        "audit_naming_convention",
+        "audit_render_settings",
+        "qc_viewer_pair",
+    ],
 }
 
 
@@ -187,6 +198,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "copycat": (
         "CopyCat ML training + Cattery model registry. Training tools "
         "are async Tasks; inference + listing are synchronous."
+    ),
+    "audit": (
+        "Read-only QC scans (write paths, naming, render settings, "
+        "ACEScct consistency) plus a Switch+Grade visual-diff builder."
     ),
 }
 

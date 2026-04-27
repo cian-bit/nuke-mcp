@@ -1016,6 +1016,11 @@ class MockNukeServer:
             "list_cattery_models": self._list_cattery_models,
             "cancel_copycat": self._cancel_copycat,
             "cancel_install": self._cancel_install,
+            # C9 audit + QC handlers (audit_acescct_consistency owned by C2 above)
+            "audit_write_paths": self._audit_write_paths,
+            "audit_naming_convention": self._audit_naming_convention,
+            "audit_render_settings": self._audit_render_settings,
+            "qc_viewer_pair": self._qc_viewer_pair,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -2947,6 +2952,174 @@ class MockNukeServer:
     def _cancel_install(self, p: dict) -> dict:
         self.cancelled_installs.append(p.get("task_id"))
         return {"cancelled": True, "task_id": p.get("task_id")}
+
+    # ------------------------------------------------------------------
+    # C9 audit handlers -- mirror addon.py logic on top of self.nodes /
+    # self.script_info so audit tools can be exercised end-to-end.
+    # ------------------------------------------------------------------
+
+    def _audit_expand_root(self, token: str) -> tuple[str | None, str | None]:
+        if token.startswith("$"):
+            import os
+
+            var = token[1:]
+            val = os.environ.get(var)
+            if not val:
+                return None, var
+            return val, None
+        return token, None
+
+    def _audit_normalize(self, path: str) -> str:
+        import os
+
+        return os.path.normcase(os.path.normpath(path))
+
+    def _audit_write_paths(self, p: dict) -> dict:
+        import os
+
+        self.typed_calls.append(("audit_write_paths", dict(p)))
+        raw_roots = p.get("allow_roots") or ["$SS"]
+        roots: list[str] = []
+        findings: list[dict] = []
+
+        for token in raw_roots:
+            expanded, missing = self._audit_expand_root(token)
+            if missing is not None:
+                findings.append(
+                    {
+                        "severity": "info",
+                        "node": "",
+                        "message": f"allow-list root ${missing} is unset; skipped",
+                        "fix_suggestion": (f"set ${missing} or remove it from allow_roots"),
+                    }
+                )
+                continue
+            if expanded:
+                roots.append(self._audit_normalize(expanded))
+
+        for name, node in self.nodes.items():
+            if node["type"] != "Write":
+                continue
+            path = node.get("knobs", {}).get("file") or ""
+            if not path:
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "node": name,
+                        "path": "",
+                        "message": "Write node has no file path set",
+                        "fix_suggestion": (
+                            "set the file knob to a path under an allow-listed root"
+                        ),
+                    }
+                )
+                continue
+            normalized = self._audit_normalize(path)
+            ok = any(normalized == root or normalized.startswith(root + os.sep) for root in roots)
+            if not ok:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "node": name,
+                        "path": path,
+                        "message": (f"Write path is outside the allow-listed roots: {path}"),
+                        "fix_suggestion": (f"move the output under one of: {', '.join(raw_roots)}"),
+                    }
+                )
+        return {"findings": findings}
+
+    def _audit_naming_convention(self, p: dict) -> dict:
+        self.typed_calls.append(("audit_naming_convention", dict(p)))
+        prefix = p.get("prefix", "ss_")
+        case_sensitive = bool(p.get("case_sensitive", True))
+        cmp_prefix = prefix if case_sensitive else prefix.lower()
+        findings: list[dict] = []
+        for name, node in self.nodes.items():
+            if name == "root" or node["type"] == "Root":
+                continue
+            target = name if case_sensitive else name.lower()
+            if not target.startswith(cmp_prefix):
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "node": name,
+                        "message": (f"node name {name!r} does not start with prefix {prefix!r}"),
+                        "fix_suggestion": f"rename to {prefix}{name}",
+                    }
+                )
+        return {"findings": findings}
+
+    def _audit_render_settings(self, p: dict) -> dict:
+        self.typed_calls.append(("audit_render_settings", dict(p)))
+        expected_fps = float(p.get("expected_fps", 24.0))
+        expected_format = str(p.get("expected_format", "2048x1080"))
+        expected_range = p.get("expected_range")
+
+        findings: list[dict] = []
+        actual_fps = float(self.script_info.get("fps", 24.0))
+        if abs(actual_fps - expected_fps) > 1e-6:
+            findings.append(
+                {
+                    "severity": "error",
+                    "node": "__root__",
+                    "message": (f"script fps is {actual_fps}, expected {expected_fps}"),
+                    "fix_suggestion": (f"set Project Settings -> fps to {expected_fps}"),
+                }
+            )
+
+        actual_format = str(self.script_info.get("format", ""))
+        compact_actual = actual_format.replace(" ", "")
+        compact_expected = expected_format.replace(" ", "")
+        if expected_format not in actual_format and not compact_actual.startswith(compact_expected):
+            findings.append(
+                {
+                    "severity": "error",
+                    "node": "__root__",
+                    "message": (
+                        f"script format is {actual_format!r}, " f"expected {expected_format!r}"
+                    ),
+                    "fix_suggestion": (
+                        f"set Project Settings -> full size format to {expected_format}"
+                    ),
+                }
+            )
+
+        if expected_range is not None:
+            first, last = int(expected_range[0]), int(expected_range[1])
+            actual_first = int(self.script_info.get("first_frame", 1))
+            actual_last = int(self.script_info.get("last_frame", 1))
+            if actual_first != first or actual_last != last:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "node": "__root__",
+                        "message": (
+                            f"frame range is {actual_first}-{actual_last}, "
+                            f"expected {first}-{last}"
+                        ),
+                        "fix_suggestion": (f"set frame range to {first}-{last}"),
+                    }
+                )
+        return {"findings": findings}
+
+    def _qc_viewer_pair(self, p: dict) -> dict:
+        self.typed_calls.append(("qc_viewer_pair", dict(p)))
+        beauty = p["beauty"]
+        recombined = p["recombined"]
+        if beauty not in self.nodes:
+            raise ValueError(f"beauty node not found: {beauty}")
+        if recombined not in self.nodes:
+            raise ValueError(f"recombined node not found: {recombined}")
+        merge_name = self._register_node(
+            "Merge2", None, "Merge1", [beauty, recombined], knobs={"operation": "difference"}
+        )
+        grade_name = self._register_node(
+            "Grade", None, "Grade1", [merge_name], knobs={"white": 10.0}
+        )
+        switch_name = self._register_node(
+            "Switch", None, "Switch1", [beauty, recombined, grade_name]
+        )
+        return self._node_ref_from_state(switch_name)
 
 
 @pytest.fixture(autouse=True)

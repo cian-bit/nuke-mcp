@@ -38,6 +38,7 @@ _GATES: tuple[tuple[str, float], ...] = (
     # C4: brand-new distortion module. Covers the four tool functions,
     # async dispatch helper, and STMap cache-root resolution.
     ("tools/distortion.py", 75.0),
+    ("tools/audit.py", 80.0),
     ("tools/digest.py", 85.0),
     ("connection.py", 85.0),
     ("tools/_helpers.py", 75.0),

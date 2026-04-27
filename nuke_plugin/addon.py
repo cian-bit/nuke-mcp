@@ -2806,6 +2806,100 @@ def _handle_audit_acescct_consistency(params: dict) -> dict:
     return {"findings": findings}
 
 
+# C9: read-only audit + QC handlers
+#
+# Each finding has the canonical shape:
+#   {severity, node, message, fix_suggestion, ...extras}
+# severity is one of "error" | "warning" | "info". Auditors NEVER
+# auto-fix -- they surface signal and leave the artist in control.
+# ---------------------------------------------------------------------------
+
+
+def _expand_audit_root(token: str) -> tuple[str | None, str | None]:
+    """Expand a single allow-list token into (expanded_path, missing_var).
+
+    Returns ``(path, None)`` on a successful expansion; ``(None, var)``
+    when ``token`` named an env var that wasn't set so the caller can
+    surface a finding rather than silently widening the allow-list.
+    """
+    if token.startswith("$"):
+        var = token[1:]
+        val = os.environ.get(var)
+        if not val:
+            return None, var
+        return val, None
+    return token, None
+
+
+def _normalize_audit_root(path: str) -> str:
+    """Normalize an allow-list root for comparison."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _handle_audit_write_paths(params: dict) -> dict:
+    """Flag Write nodes whose path lies outside the allow-listed roots.
+
+    ``$VAR`` tokens in ``allow_roots`` expand from the addon-side env.
+    Each unset variable produces one ``info`` finding (so the audit
+    tells you the allow-list is incomplete) plus continues with the
+    remaining roots.
+    """
+    import nuke
+
+    raw_roots = params.get("allow_roots") or ["$SS"]
+    roots: list[str] = []
+    findings: list[dict[str, Any]] = []
+
+    for token in raw_roots:
+        expanded, missing = _expand_audit_root(token)
+        if missing is not None:
+            findings.append(
+                {
+                    "severity": "info",
+                    "node": "",
+                    "message": f"allow-list root ${missing} is unset; skipped",
+                    "fix_suggestion": f"set ${missing} or remove it from allow_roots",
+                }
+            )
+            continue
+        if expanded:
+            roots.append(_normalize_audit_root(expanded))
+
+    for n in nuke.allNodes():
+        if n.Class() != "Write":
+            continue
+        knob = n.knob("file")
+        if knob is None:
+            continue
+        path = knob.value() or ""
+        if not path:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "node": n.name(),
+                    "path": "",
+                    "message": "Write node has no file path set",
+                    "fix_suggestion": "set the file knob to a path under an allow-listed root",
+                }
+            )
+            continue
+
+        normalized = _normalize_audit_root(path)
+        ok = any(normalized == root or normalized.startswith(root + os.sep) for root in roots)
+        if not ok:
+            findings.append(
+                {
+                    "severity": "error",
+                    "node": n.name(),
+                    "path": path,
+                    "message": (f"Write path is outside the allow-listed roots: {path}"),
+                    "fix_suggestion": (f"move the output under one of: {', '.join(raw_roots)}"),
+                }
+            )
+
+    return {"findings": findings}
+
+
 def _set_ocio_colorspace_knobs(node: Any, in_cs: str, out_cs: str) -> None:
     """Set the ``in_colorspace`` / ``out_colorspace`` knobs on an OCIOColorSpace.
 
@@ -3967,6 +4061,142 @@ def _flip_blood_payload_from_group(group: Any) -> dict:
     }
 
 
+def _handle_audit_naming_convention(params: dict) -> dict:
+    """Flag nodes whose names don't begin with ``prefix``.
+
+    Severity is ``warning`` -- a misnamed node is artist-visible
+    clutter, not a render-blocking error. The Root node is excluded
+    (its name is fixed by Nuke).
+    """
+    import nuke
+
+    prefix = params.get("prefix", "ss_")
+    case_sensitive = bool(params.get("case_sensitive", True))
+
+    cmp_prefix = prefix if case_sensitive else prefix.lower()
+
+    findings: list[dict[str, Any]] = []
+    for n in nuke.allNodes():
+        name = n.name()
+        # The implicit Root node has a fixed name -- never flag it.
+        if name == "root" or n.Class() == "Root":
+            continue
+        target = name if case_sensitive else name.lower()
+        if not target.startswith(cmp_prefix):
+            findings.append(
+                {
+                    "severity": "warning",
+                    "node": name,
+                    "message": (f"node name {name!r} does not start with prefix {prefix!r}"),
+                    "fix_suggestion": f"rename to {prefix}{name}",
+                }
+            )
+    return {"findings": findings}
+
+
+def _format_matches(actual_format: str, expected: str) -> bool:
+    """True if a Nuke format name matches the expected ``WIDTHxHEIGHT`` shorthand."""
+    if expected in actual_format:
+        return True
+    # Nuke format names look like "HD 1920x1080" or "2K_DCP 2048x1080 1.0";
+    # match either the leading token or any embedded ``WIDTHxHEIGHT``.
+    return actual_format.replace(" ", "").startswith(expected.replace(" ", ""))
+
+
+def _handle_audit_render_settings(params: dict) -> dict:
+    """Flag root-script settings that don't match the expected values."""
+    import nuke
+
+    expected_fps = float(params.get("expected_fps", 24.0))
+    expected_format = str(params.get("expected_format", "2048x1080"))
+    expected_range = params.get("expected_range")
+
+    root = nuke.root()
+    findings: list[dict[str, Any]] = []
+
+    actual_fps = float(root["fps"].value())
+    if abs(actual_fps - expected_fps) > 1e-6:
+        findings.append(
+            {
+                "severity": "error",
+                "node": "__root__",
+                "message": (f"script fps is {actual_fps}, expected {expected_fps}"),
+                "fix_suggestion": f"set Project Settings -> fps to {expected_fps}",
+            }
+        )
+
+    actual_format = root.format().name() if root.format() else ""
+    if not _format_matches(actual_format, expected_format):
+        findings.append(
+            {
+                "severity": "error",
+                "node": "__root__",
+                "message": (f"script format is {actual_format!r}, expected {expected_format!r}"),
+                "fix_suggestion": (
+                    f"set Project Settings -> full size format to {expected_format}"
+                ),
+            }
+        )
+
+    if expected_range is not None:
+        first, last = int(expected_range[0]), int(expected_range[1])
+        actual_first = int(root["first_frame"].value())
+        actual_last = int(root["last_frame"].value())
+        if actual_first != first or actual_last != last:
+            findings.append(
+                {
+                    "severity": "error",
+                    "node": "__root__",
+                    "message": (
+                        f"frame range is {actual_first}-{actual_last}, " f"expected {first}-{last}"
+                    ),
+                    "fix_suggestion": (f"set frame range to {first}-{last}"),
+                }
+            )
+
+    return {"findings": findings}
+
+
+def _handle_qc_viewer_pair(params: dict) -> dict:
+    """Build a Switch + Merge(diff) + Grade(gain=10) chain for visual QC."""
+    import nuke
+
+    beauty_name = params["beauty"]
+    recombined_name = params["recombined"]
+
+    beauty = _resolve_node(beauty_name)
+    if beauty is None:
+        raise ValueError(f"beauty node not found: {beauty_name}")
+    recombined = _resolve_node(recombined_name)
+    if recombined is None:
+        raise ValueError(f"recombined node not found: {recombined_name}")
+
+    # Diff branch: Merge(operation=difference) -> Grade(white=10).
+    diff_merge = nuke.nodes.Merge2()
+    diff_merge.setInput(0, beauty)
+    diff_merge.setInput(1, recombined)
+    if diff_merge.knob("operation"):
+        with contextlib.suppress(Exception):
+            diff_merge["operation"].setValue("difference")
+    diff_merge.setXYpos(beauty.xpos() + 80, beauty.ypos() + 60)
+
+    diff_grade = nuke.nodes.Grade()
+    diff_grade.setInput(0, diff_merge)
+    if diff_grade.knob("white"):
+        with contextlib.suppress(Exception):
+            diff_grade["white"].setValue(10.0)
+    diff_grade.setXYpos(diff_merge.xpos(), diff_merge.ypos() + 60)
+
+    # Switch: input 0 = beauty, input 1 = recombined, input 2 = diff.
+    switch = nuke.nodes.Switch()
+    switch.setInput(0, beauty)
+    switch.setInput(1, recombined)
+    switch.setInput(2, diff_grade)
+    switch.setXYpos(beauty.xpos(), beauty.ypos() + 180)
+
+    return _node_ref(switch)
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -4037,6 +4267,13 @@ HANDLERS: dict[str, Any] = {
     # C4 distortion / STMap envelope
     "bake_lens_distortion_envelope": _handle_bake_lens_distortion_envelope,
     "apply_idistort": _handle_apply_idistort,
+    # C6 deep workflow macro
+    "setup_flip_blood_comp": _handle_setup_flip_blood_comp,
+    # C9 audit + QC handlers (read-only scans + 1 BENIGN_NEW QC builder)
+    "audit_write_paths": _handle_audit_write_paths,
+    "audit_naming_convention": _handle_audit_naming_convention,
+    "audit_render_settings": _handle_audit_render_settings,
+    "qc_viewer_pair": _handle_qc_viewer_pair,
 }
 
 
@@ -4049,6 +4286,4 @@ ASYNC_HANDLERS: dict[str, Any] = {
     "render_async": _start_render_async,
     "apply_smartvector_propagate_async": _start_apply_smartvector_propagate_async,
     "generate_stmap_async": _start_generate_stmap_async,
-    # C6 deep workflow macro
-    "setup_flip_blood_comp": _handle_setup_flip_blood_comp,
 }
