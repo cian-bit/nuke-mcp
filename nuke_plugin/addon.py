@@ -2251,6 +2251,377 @@ def _handle_deep_to_image(params: dict) -> dict:
     return _node_ref(n)
 
 
+# ---------------------------------------------------------------------------
+# C2: OCIO / ACEScct color management
+# ---------------------------------------------------------------------------
+
+# Image-file extensions that imply a non-linear (sRGB/display) source.
+# Used by ``audit_acescct_consistency`` to flag Reads with
+# ``colorspace=default`` whose paths look like sRGB textures rather than
+# scene-linear EXR/DPX deliveries.
+_NONLINEAR_EXTS = (".png", ".jpg", ".jpeg")
+
+# Heuristic substring -- if a Read filename contains this, the colorspace
+# should almost certainly be sRGB-textured rather than the working space.
+_SRGB_HINT = "_srgb"
+
+
+def _root_knob_value(knob_name: str) -> str:
+    """Return the string value of a root knob, or an empty string if absent.
+
+    Several colour-management knobs were renamed across Nuke versions
+    (``OCIOConfigPath`` -> ``OCIO_config`` -> ``ocio_config_path``),
+    and a few don't exist on the Nuke variant at all (``monitorLut``
+    is NukeStudio/Hiero only on some builds). Returning ``""`` for
+    missing knobs keeps the wire shape stable across versions instead
+    of forcing the caller to special-case every knob.
+    """
+    import nuke
+
+    root = nuke.root()
+    knob = root.knob(knob_name)
+    if knob is None:
+        return ""
+    try:
+        return str(knob.value())
+    except Exception:
+        return ""
+
+
+def _handle_get_color_management(params: dict) -> dict:
+    """Return the script's color-management state.
+
+    Reads ``nuke.root()`` knobs and assembles a flat dict. Keys are
+    stable across Nuke versions; missing knobs come back as ``""``.
+    """
+    return {
+        "color_management": _root_knob_value("colorManagement"),
+        "ocio_config": _root_knob_value("OCIO_config"),
+        "working_space": _root_knob_value("workingSpaceLUT"),
+        "default_view": _root_knob_value("defaultViewerLUT"),
+        "monitor_lut": _root_knob_value("monitorLut"),
+    }
+
+
+def _handle_set_working_space(params: dict) -> dict:
+    """Set ``nuke.root()['workingSpaceLUT']`` after validating the value.
+
+    Validates ``space`` against the knob's enumeration when the knob
+    exposes one (``Enumeration_Knob.values()``). Free-form OCIO
+    configs may have hundreds of values; if the enumeration is empty
+    (rare, but possible for custom configs that surface the knob as
+    a String_Knob) we accept the value and let Nuke surface its own
+    error.
+    """
+    import nuke
+
+    space = params["space"]
+    root = nuke.root()
+    knob = root.knob("workingSpaceLUT")
+    if knob is None:
+        raise ValueError("nuke.root() has no 'workingSpaceLUT' knob")
+
+    values_method = getattr(knob, "values", None)
+    if callable(values_method):
+        allowed = list(values_method())
+        if allowed and space not in allowed:
+            raise ValueError(
+                f"invalid working space {space!r}; "
+                f"allowed: {sorted(allowed)[:10]}{' ...' if len(allowed) > 10 else ''}"
+            )
+
+    knob.setValue(space)
+    return {
+        "working_space": str(knob.value()),
+    }
+
+
+def _read_node_colorspace(node: Any) -> str:
+    """Pull the ``colorspace`` knob value off a Read/Write node, or ''.
+
+    Nuke's Read/Write expose ``colorspace`` as an enumeration. The
+    ``default`` value indicates "follow the OCIO config's input rules"
+    -- the audit treats that as the unset state and flags suspicious
+    paths.
+    """
+    knob = node.knob("colorspace")
+    if knob is None:
+        return ""
+    try:
+        return str(knob.value())
+    except Exception:
+        return ""
+
+
+def _path_looks_nonlinear(path: str) -> bool:
+    """True if ``path`` matches the sRGB/PNG/JPG heuristic."""
+    if not path:
+        return False
+    lowered = path.lower()
+    if _SRGB_HINT in lowered:
+        return True
+    return lowered.endswith(_NONLINEAR_EXTS)
+
+
+def _is_acescg_pipe(working_space: str) -> bool:
+    """True if the script's working space implies an ACEScg context.
+
+    Matches ``ACES - ACEScg`` (OCIO 1.x) and ``ACEScg`` (legacy short
+    form). Defensive: variations like ``ACES2065-1`` are NOT ACEScg
+    even though they are ACES-family, so we don't blanket-match
+    ``startswith("ACES")``.
+    """
+    return "ACEScg" in (working_space or "")
+
+
+def _has_upstream_acescct_conversion(node: Any, max_depth: int = 12) -> bool:
+    """Walk upstream looking for an OCIOColorSpace converting INTO ACEScct.
+
+    ``max_depth`` caps the walk so we don't pay an O(N) cost on every
+    audited node in deep graphs. The audit only needs to see the
+    nearest upstream conversion -- if a node 12 hops away converts to
+    ACEScct, the heuristic is still happy.
+    """
+    seen: set[str] = set()
+    frontier: list[Any] = [node]
+    depth = 0
+    while frontier and depth < max_depth:
+        next_frontier: list[Any] = []
+        for n in frontier:
+            for i in range(n.inputs()):
+                inp = n.input(i)
+                if inp is None:
+                    continue
+                key = inp.name()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if inp.Class() == "OCIOColorSpace":
+                    out_knob = inp.knob("out_colorspace")
+                    if out_knob is not None:
+                        try:
+                            if "ACEScct" in str(out_knob.value()):
+                                return True
+                        except Exception:
+                            pass
+                next_frontier.append(inp)
+        frontier = next_frontier
+        depth += 1
+    return False
+
+
+def _handle_audit_acescct_consistency(params: dict) -> dict:
+    """Walk every node and flag colour-management mistakes.
+
+    Pure read -- no node creation, no knob mutation. Returns a
+    ``{findings: [...]}`` dict matching the public schema. ``strict``
+    demotes the Grade-without-ACEScct heuristic from ``warning`` to
+    ``info`` when False; Read/Write checks always fire at full
+    severity.
+    """
+    import nuke
+
+    strict = bool(params.get("strict", True))
+    working = _root_knob_value("workingSpaceLUT")
+    is_acescg = _is_acescg_pipe(working)
+
+    findings: list[dict[str, str]] = []
+
+    for node in nuke.allNodes():
+        cls = node.Class()
+        nname = node.name()
+
+        if cls == "Read":
+            cspace = _read_node_colorspace(node)
+            file_knob = node.knob("file")
+            path = ""
+            if file_knob is not None:
+                try:
+                    path = str(file_knob.value())
+                except Exception:
+                    path = ""
+            if cspace.startswith("default") and _path_looks_nonlinear(path):
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "node": nname,
+                        "message": (
+                            f"Read '{nname}' colorspace=default but path "
+                            f"'{path}' looks non-linear (sRGB/PNG/JPG)."
+                        ),
+                        "fix_suggestion": (
+                            "Set the Read 'colorspace' knob to "
+                            "'sRGB - Texture' (or your config's "
+                            "equivalent) instead of leaving it at default."
+                        ),
+                    }
+                )
+
+        elif cls == "Grade" and is_acescg:
+            severity = "warning" if strict else "info"
+            if not _has_upstream_acescct_conversion(node):
+                findings.append(
+                    {
+                        "severity": severity,
+                        "node": nname,
+                        "message": (
+                            f"Grade '{nname}' is downstream of an ACEScg "
+                            f"working space but no upstream OCIOColorSpace "
+                            f"converts to ACEScct."
+                        ),
+                        "fix_suggestion": (
+                            "Insert an OCIOColorSpace ACEScg -> ACEScct "
+                            "before the Grade and a matching ACEScct -> "
+                            "ACEScg after it."
+                        ),
+                    }
+                )
+
+        elif cls == "Write":
+            cspace = _read_node_colorspace(node)
+            file_knob = node.knob("file")
+            path = ""
+            if file_knob is not None:
+                try:
+                    path = str(file_knob.value())
+                except Exception:
+                    path = ""
+            # Linear EXR/DPX delivery should not be tagged sRGB.
+            lowered_path = path.lower()
+            is_linear_delivery = lowered_path.endswith((".exr", ".dpx", ".tif", ".tiff"))
+            looks_srgb = "srgb" in cspace.lower() or cspace.lower() == "rec.709"
+            if is_linear_delivery and looks_srgb:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "node": nname,
+                        "message": (
+                            f"Write '{nname}' delivers '{path}' as "
+                            f"colorspace='{cspace}' -- "
+                            f"scene-linear formats expect a linear / "
+                            f"working-space tag."
+                        ),
+                        "fix_suggestion": (
+                            "Set the Write 'colorspace' knob to the "
+                            "scene-linear delivery target (typically "
+                            "'ACES - ACEScg' or 'scene_linear')."
+                        ),
+                    }
+                )
+
+    return {"findings": findings}
+
+
+def _set_ocio_colorspace_knobs(node: Any, in_cs: str, out_cs: str) -> None:
+    """Set the ``in_colorspace`` / ``out_colorspace`` knobs on an OCIOColorSpace.
+
+    The knob names are stable across Nuke 13/14/15. Catches
+    enumeration errors (passing a bogus colourspace) and re-raises
+    with a clearer message so the caller knows which knob and value
+    failed.
+    """
+    in_knob = node.knob("in_colorspace")
+    out_knob = node.knob("out_colorspace")
+    if in_knob is not None:
+        try:
+            in_knob.setValue(in_cs)
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError(f"OCIOColorSpace in_colorspace={in_cs!r} rejected: {exc}") from exc
+    if out_knob is not None:
+        try:
+            out_knob.setValue(out_cs)
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError(f"OCIOColorSpace out_colorspace={out_cs!r} rejected: {exc}") from exc
+
+
+def _handle_convert_node_colorspace(params: dict) -> dict:
+    """Wrap ``node`` in an OCIOColorSpace pair (in->out upstream, out->in downstream).
+
+    The trailing converter rebuilds every downstream consumer that was
+    feeding from ``node``: each one is re-wired to the trailing
+    converter so the surrounding graph still sees ``in_cs``. Nodes
+    that already feed from the leading converter (i.e. the wrap was
+    applied earlier) are left alone.
+    """
+    import nuke
+
+    target_name = params["node"]
+    in_cs = params["in_cs"]
+    out_cs = params["out_cs"]
+
+    target = _resolve_node(target_name)
+    if target is None:
+        raise ValueError(f"node not found: {target_name}")
+
+    # Snapshot downstream consumers BEFORE creating the trailing
+    # converter -- otherwise the trailing converter itself would show
+    # up in the consumer list and we'd self-rewire.
+    consumers: list[tuple[Any, int]] = []
+    for n in nuke.allNodes():
+        if n is target:
+            continue
+        for i in range(n.inputs()):
+            if n.input(i) is target:
+                consumers.append((n, i))
+
+    # Leading converter -- inserts before target by detaching its
+    # input-0 and re-feeding through the new node.
+    upstream = target.input(0) if target.inputs() > 0 else None
+
+    leading = nuke.nodes.OCIOColorSpace()
+    if upstream is not None:
+        leading.setInput(0, upstream)
+    _set_ocio_colorspace_knobs(leading, in_cs, out_cs)
+    leading.setXYpos(target.xpos() - 80, target.ypos() - 60)
+    target.setInput(0, leading)
+
+    # Trailing converter -- fed by target, replaces target in every
+    # snapshotted consumer.
+    trailing = nuke.nodes.OCIOColorSpace()
+    trailing.setInput(0, target)
+    _set_ocio_colorspace_knobs(trailing, out_cs, in_cs)
+    trailing.setXYpos(target.xpos() + 80, target.ypos() + 60)
+    for consumer, slot in consumers:
+        consumer.setInput(slot, trailing)
+
+    return {
+        "leading": _node_ref(leading),
+        "trailing": _node_ref(trailing),
+        "wrapped": target.name(),
+    }
+
+
+def _handle_create_ocio_colorspace(params: dict) -> dict:
+    """Create a single OCIOColorSpace fed by ``input_node``.
+
+    Idempotent on ``name=``: when the named node already exists with
+    the same class + leading input, returns the existing NodeRef
+    without creating a duplicate.
+    """
+    import nuke
+
+    input_name = params["input_node"]
+    in_cs = params["in_cs"]
+    out_cs = params["out_cs"]
+    name = params.get("name")
+
+    src = _resolve_node(input_name)
+    if src is None:
+        raise ValueError(f"input_node not found: {input_name}")
+
+    expected_inputs = [src.name()]
+    cached = _maybe_existing(name, "OCIOColorSpace", expected_inputs)
+    if cached is not None:
+        return cached
+
+    cs = nuke.nodes.OCIOColorSpace()
+    cs.setInput(0, src)
+    _set_ocio_colorspace_knobs(cs, in_cs, out_cs)
+    cs.setXYpos(src.xpos(), src.ypos() + 60)
+    _set_name(cs, name)
+    return _node_ref(cs)
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -2306,4 +2677,10 @@ HANDLERS: dict[str, Any] = {
     "create_deep_holdout": _handle_create_deep_holdout,
     "create_deep_transform": _handle_create_deep_transform,
     "deep_to_image": _handle_deep_to_image,
+    # C2 OCIO / ACEScct color management
+    "get_color_management": _handle_get_color_management,
+    "set_working_space": _handle_set_working_space,
+    "audit_acescct_consistency": _handle_audit_acescct_consistency,
+    "convert_node_colorspace": _handle_convert_node_colorspace,
+    "create_ocio_colorspace": _handle_create_ocio_colorspace,
 }
