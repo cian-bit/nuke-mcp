@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 from nuke_mcp.annotations import (
+    BENIGN_NEW,
     DESTRUCTIVE,
     DESTRUCTIVE_OPEN,
     IDEMPOTENT,
@@ -32,11 +33,11 @@ _HINT_KEYS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHin
 # ---------------------------------------------------------------------------
 # Snapshot fixture: every tool's expected hint dict.
 # ---------------------------------------------------------------------------
-# Tools that create brand-new nodes (create_*, shuffle_channels, setup_precomp,
+# Tools that create brand-new nodes (create_*, shuffle_channels, setup_*,
 # create_roto) carry only ``destructiveHint=False`` -- they don't fit any of
-# the four named presets.
-
-_BENIGN_NEW = {"destructiveHint": False}
+# the four named presets. Calling them twice creates duplicate nodes
+# (Foo1, Foo2, ...), so they are NOT idempotent in the MCP sense even
+# though the addon-side validation is deterministic.
 
 EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     # read.py
@@ -46,14 +47,14 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "snapshot_comp": READ_ONLY,
     "diff_comp": READ_ONLY,
     # graph.py
-    "create_node": _BENIGN_NEW,
+    "create_node": BENIGN_NEW,
     "delete_node": DESTRUCTIVE,
     "find_nodes": READ_ONLY,
     "list_nodes": READ_ONLY,
     "connect_nodes": IDEMPOTENT,
     "auto_layout": IDEMPOTENT,
     "modify_node": IDEMPOTENT,
-    "create_nodes": _BENIGN_NEW,
+    "create_nodes": BENIGN_NEW,
     "disconnect_node_input": IDEMPOTENT,
     "set_node_position": IDEMPOTENT,
     # knobs.py
@@ -66,32 +67,32 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "load_script": DESTRUCTIVE_OPEN,
     "set_frame_range": IDEMPOTENT,
     # render.py
-    "setup_write": IDEMPOTENT,
+    "setup_write": BENIGN_NEW,
     "render_frames": DESTRUCTIVE_OPEN,
-    "setup_precomp": _BENIGN_NEW,
+    "setup_precomp": BENIGN_NEW,
     "list_precomps": READ_ONLY,
     # channels.py
     "list_channels": READ_ONLY,
-    "shuffle_channels": _BENIGN_NEW,
-    "setup_aov_merge": IDEMPOTENT,
+    "shuffle_channels": BENIGN_NEW,
+    "setup_aov_merge": BENIGN_NEW,
     # viewer.py
-    "view_node": _BENIGN_NEW,
+    "view_node": BENIGN_NEW,
     "set_viewer_lut": IDEMPOTENT,
     # code.py
     "execute_python": DESTRUCTIVE_OPEN,
     # comp.py
-    "setup_keying": IDEMPOTENT,
-    "setup_color_correction": IDEMPOTENT,
-    "setup_merge": IDEMPOTENT,
-    "setup_transform": IDEMPOTENT,
-    "setup_denoise": IDEMPOTENT,
+    "setup_keying": BENIGN_NEW,
+    "setup_color_correction": BENIGN_NEW,
+    "setup_merge": BENIGN_NEW,
+    "setup_transform": BENIGN_NEW,
+    "setup_denoise": BENIGN_NEW,
     # expressions.py
     "set_expression": IDEMPOTENT,
     "clear_expression": IDEMPOTENT,
     "set_keyframe": IDEMPOTENT,
     "list_keyframes": READ_ONLY,
     # roto.py
-    "create_roto": _BENIGN_NEW,
+    "create_roto": BENIGN_NEW,
     "list_roto_shapes": READ_ONLY,
     # digest.py (B7)
     "scene_digest": READ_ONLY,
@@ -186,3 +187,39 @@ def test_combined_presets_merge() -> None:
         "idempotentHint": True,
         "destructiveHint": False,
     }
+
+
+def test_benign_new_preset_shape() -> None:
+    """BENIGN_NEW carries only ``destructiveHint=False`` -- no idempotent
+    claim, since duplicate calls produce duplicate nodes.
+    """
+    assert BENIGN_NEW == {"destructiveHint": False}
+    assert "idempotentHint" not in BENIGN_NEW
+
+
+def test_setup_keying_no_longer_claims_idempotent(all_tools: list) -> None:
+    """GPT-5.5 finding #8 regression check: setup_keying creates new
+    nodes per call, so it must not advertise idempotentHint=True.
+    """
+    by_name = {t.name: t for t in all_tools}
+    keying = by_name["setup_keying"]
+    hints = _hint_dict(keying.annotations)
+    assert hints.get("idempotentHint") is not True
+    assert hints == BENIGN_NEW
+
+
+def test_all_setup_tools_advertise_benign_new(all_tools: list) -> None:
+    """Every setup_* tool that creates new nodes must use BENIGN_NEW."""
+    by_name = {t.name: t for t in all_tools}
+    new_node_setups = (
+        "setup_keying",
+        "setup_color_correction",
+        "setup_merge",
+        "setup_transform",
+        "setup_denoise",
+        "setup_write",
+        "setup_aov_merge",
+    )
+    for name in new_node_setups:
+        hints = _hint_dict(by_name[name].annotations)
+        assert hints == BENIGN_NEW, f"{name} expected BENIGN_NEW, got {hints}"

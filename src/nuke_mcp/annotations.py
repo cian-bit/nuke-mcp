@@ -21,6 +21,14 @@ IDEMPOTENT: dict[str, bool] = {"idempotentHint": True, "destructiveHint": False}
 DESTRUCTIVE: dict[str, bool] = {"destructiveHint": True}
 OPEN_WORLD: dict[str, bool] = {"openWorldHint": True}
 
+# Tools that create new state but don't destroy. Distinct from
+# IDEMPOTENT: a duplicate call DOES create duplicate nodes (Nuke names
+# them ``Foo1``, ``Foo2`` etc.), so the second call's end-state isn't
+# the same as the first. ``destructiveHint=False`` is still informative
+# -- the schema test asserts every tool carries at least one explicit
+# hint, of either polarity.
+BENIGN_NEW: dict[str, bool] = {"destructiveHint": False}
+
 # Common combinations -- spelled out for grep-ability.
 READ_AND_IDEMPOTENT: dict[str, bool] = {**READ_ONLY, **IDEMPOTENT}
 DESTRUCTIVE_OPEN: dict[str, bool] = {**DESTRUCTIVE, **OPEN_WORLD}

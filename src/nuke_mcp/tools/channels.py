@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
-from nuke_mcp.annotations import IDEMPOTENT, READ_ONLY
+from nuke_mcp.annotations import BENIGN_NEW, READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -52,7 +52,8 @@ __result__ = {{"name": s.name(), "from": {from_layer!r}, "to": {to_layer!r}}}
 """
         return connection.send("execute_python", code=code)
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    # ``setup_aov_merge`` creates fresh Merge2 chain nodes -- not idempotent.
+    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
     @nuke_command("setup_aov_merge")
     def setup_aov_merge(read_nodes: str) -> dict:
         """Merge multiple AOV Read nodes together (additive). Common EXR workflow.
