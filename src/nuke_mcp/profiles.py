@@ -129,13 +129,14 @@ PROFILES: dict[str, list[str]] = {
         # C5 workflow macros built on the C1 primitives above.
         "setup_spaceship_track_patch",
     ],
-    # Deep-comp primitives.
+    # Deep-comp primitives + workflow macros (C6).
     "deep": [
         "create_deep_recolor",
         "create_deep_merge",
         "create_deep_holdout",
         "create_deep_transform",
         "deep_to_image",
+        "setup_flip_blood_comp",
     ],
     # C4 distortion / STMap envelope + SmartVector propagate.
     "distortion": [
@@ -162,7 +163,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
         "2D + 3D tracking and camera-solve primitives, plus C5 workflow "
         "macros (e.g. setup_spaceship_track_patch)."
     ),
-    "deep": "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.).",
+    "deep": (
+        "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.) "
+        "plus workflow macros (setup_flip_blood_comp)."
+    ),
     "distortion": (
         "Lens-distortion / STMap envelope + SmartVector propagate. "
         "Wraps comps in undistorted-linear, bakes vectors as Tasks."
