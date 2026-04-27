@@ -38,6 +38,9 @@ _GATES: tuple[tuple[str, float], ...] = (
     ("tools/digest.py", 85.0),
     ("connection.py", 85.0),
     ("tools/_helpers.py", 75.0),
+    # B2: brand-new modules with dedicated test files.
+    ("tasks.py", 90.0),
+    ("tools/tasks.py", 90.0),
 )
 
 

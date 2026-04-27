@@ -110,6 +110,11 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "create_deep_holdout": BENIGN_NEW,
     "create_deep_transform": BENIGN_NEW,
     "deep_to_image": BENIGN_NEW,
+    # tasks.py (B2 -- MCP 2025-11-25 Tasks primitive)
+    "tasks_list": READ_ONLY,
+    "tasks_get": READ_ONLY,
+    "tasks_cancel": DESTRUCTIVE,
+    "tasks_resume": READ_ONLY,
 }
 
 
