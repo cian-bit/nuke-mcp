@@ -100,10 +100,16 @@ PROFILES: dict[str, list[str]] = {
         "execute_python",
         "read_selected",
     ],
-    # Colour-pipeline setup tools.
+    # Colour-pipeline setup tools + C2 OCIO/ACEScct primitives.
     "color": [
         "setup_keying",
         "setup_color_correction",
+        # C2: OCIO/ACEScct
+        "get_color_management",
+        "set_working_space",
+        "audit_acescct_consistency",
+        "convert_node_colorspace",
+        "create_ocio_colorspace",
     ],
     # AOV merge / Karma EXR layer recombine.
     "aov": [
