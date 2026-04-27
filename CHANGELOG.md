@@ -7,12 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-04-27
 
-The feature-complete release. Wave 1-3 phases all merged. From 38 tools / 44 tests at v0.1.0 to **86 tools / 597 tests** here.
+The feature-complete release. Wave 1-3 phases all merged. From 38 tools / 44 tests at v0.1.0 to **96 tools / 597 tests** here.
 
 ### Headline
 
 - **First DCC MCP server to ship the [MCP 2025-11-25 Tasks primitive](https://modelcontextprotocol.io/specification/2025-11-25).** Long-running operations (`render_frames`, `train_copycat`, `bake_smartvector`, `solve_3d_camera`) return a `task_id`, stream `task_progress` notifications, and persist state to disk. Cancellable. Survives MCP reconnect, Nuke restart, and client crash.
-- **86 tools across 9 skill profiles**, surfaced lazily via `load_profile`.
+- **96 tools across 10 skill profiles**, surfaced lazily via `load_profile`.
 - **Salt Spill comp-domain depth**: AOV reconstruction, deep holdout chains, lens-distortion envelopes, planar / 3D camera tracking, OCIO/ACEScct audit, CopyCat ML training as Task.
 - **Production-grade safety**: AST + regex scanner on `execute_python` blocking destructive Nuke / OS calls and indirection paths.
 
@@ -81,7 +81,7 @@ The feature-complete release. Wave 1-3 phases all merged. From 38 tools / 44 tes
 
 #### Phase B4 -- Skill profiles (paginated tool exposure)
 
-- New `src/nuke_mcp/profiles.py`. 9 profiles: `core`, `graph_advanced`, `color`, `aov`, `tracking`, `deep`, `distortion`, `copycat`, `audit`.
+- New `src/nuke_mcp/profiles.py`. 10 profiles: `core`, `graph_advanced`, `color`, `aov`, `tracking`, `deep`, `distortion`, `copycat`, `audit`.
 - Default = `core` (~45 tools). `load_profile` / `unload_profile` / `list_profiles` runtime tools.
 - Server emits `tools/list_changed` notification on profile change.
 
@@ -179,7 +179,7 @@ The feature-complete release. Wave 1-3 phases all merged. From 38 tools / 44 tes
 | B1 truncation | 0 | ~8 | two-threshold + 2000-node fixture |
 | B2 Tasks primitive | 4 (`tasks_*` meta) | ~25 | Task store, async render |
 | B3 schema-from-signature | 0 | ~15 | registry decorator + migration |
-| B4 profiles | 3 (`list_profiles`, `load_profile`, `unload_profile`) | ~10 | 9 profiles |
+| B4 profiles | 3 (`list_profiles`, `load_profile`, `unload_profile`) | ~10 | 10 profiles |
 | B5 Pydantic outputs | 0 | ~12 | 5 models, 5 plumbed tools |
 | B6 annotations | 0 | ~5 | preset library + audit |
 | B7 speed wins | 0 | ~5 | single-pass + cache + digest delta |
@@ -192,7 +192,8 @@ The feature-complete release. Wave 1-3 phases all merged. From 38 tools / 44 tes
 | C7 CopyCat ML | 5 | ~15 | training as Task |
 | C9 audit + QC | 5 | ~18 | read-only scans + viewer pair |
 | C10 workflow prompts | 0 (8 prompts) | ~10 | first-class MCP prompts |
-| **v0.2.0 total** | **86** | **597 passing, 18 skipped** | 9 profiles, Tasks, Pydantic, audit |
+| C8 Salt Spill macros | 10 | ~34 | flag-planters composing C2-C7 + C9 |
+| **v0.2.0 total** | **96** | **648 passing, 1 skipped** | 10 profiles, Tasks, Pydantic, audit |
 
 ### Changed
 

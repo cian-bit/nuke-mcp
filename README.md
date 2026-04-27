@@ -34,7 +34,7 @@ Demo script + screenplay: [DEMO.md](DEMO.md).
 | Pydantic structured outputs | yes | n/a | no |
 | OCIO / ACEScct audit | yes | no | no |
 | CopyCat ML training as Task | yes | no | no |
-| Skill profiles (paginated tool surface) | yes (9 profiles) | n/a | no |
+| Skill profiles (paginated tool surface) | yes (10 profiles) | n/a | no |
 | AST safety scanner on `execute_python` | yes | n/a | no |
 | Audit log + destructive gates | yes | n/a | no |
 | Tool count | 86 | n/a | 40+ |
@@ -48,7 +48,7 @@ Demo script + screenplay: [DEMO.md](DEMO.md).
 
 | Capability | What you get | Profile |
 |---|---|---|
-| Tools | 86 across 9 profiles, surfaced lazily via `load_profile` | (all) |
+| Tools | 86 across 10 profiles, surfaced lazily via `load_profile` | (all) |
 | Tasks primitive | Disk-persisted state machine: `working / input_required / completed / failed / cancelled`. Survives reconnect. | core |
 | Skill profiles | Paginated tool surface. Default = `core` (~45 tools). `load_profile("tracking")` to expand. | core |
 | Pydantic outputs | `NodeDetail`, `Comp`, `RenderResult`, `KnobValue`, `DiffResult` | (cross-cutting) |
@@ -154,7 +154,7 @@ load_profile("audit")              # surface ACEScct / write-path / naming audit
 
 ## Tool surface
 
-86 tools across 9 profiles. Open [src/nuke_mcp/profiles.py](src/nuke_mcp/profiles.py) for the full mapping.
+96 tools across 10 profiles. Open [src/nuke_mcp/profiles.py](src/nuke_mcp/profiles.py) for the full mapping.
 
 | Profile | Tools | What's in it |
 |---|---|---|

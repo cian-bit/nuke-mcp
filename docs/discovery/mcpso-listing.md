@@ -53,7 +53,7 @@ Where most DCC MCP servers ship atomic node primitives, nuke-mcp ships compositi
 
 It is the first DCC MCP server to ship the MCP 2025-11-25 Tasks primitive. Long-running operations (render_frames, train_copycat, bake_smartvector, solve_3d_camera) return a task_id and stream task_progress notifications. State is persisted to disk and survives MCP reconnect, Nuke restart, and client crash. Tasks are cancellable at the next frame boundary.
 
-86 tools are organised into 9 skill profiles (core, graph_advanced, color, aov, tracking, deep, distortion, copycat, audit). Only core (45 tools) is loaded by default; the model surfaces specialised profiles via load_profile when a session needs them. This keeps the active tool surface small without sacrificing depth.
+96 tools are organised into 10 skill profiles (core, graph_advanced, color, aov, tracking, deep, distortion, copycat, audit). Only core (45 tools) is loaded by default; the model surfaces specialised profiles via load_profile when a session needs them. This keeps the active tool surface small without sacrificing depth.
 
 Safety: execute_python runs through an AST + regex scanner that blocks nuke.scriptClose, os.remove, write-mode open(), and indirection paths (getattr, __import__, eval, exec, walrus, globals / vars / sys.modules, unicode homoglyphs). Audit tools are read-only and never auto-fix.
 
@@ -83,7 +83,7 @@ mcp.so listings render strongest with three to five screenshots. Capture in this
 1. **Hero**: Nuke DAG mid-comp with a `KarmaAOV_ss_0170` NetworkBox visible. Claude Desktop side panel showing the `setup_karma_aov_pipeline` tool chip. 1920x1080, light theme so the screenshot survives mcp.so's compression.
 2. **Tasks UX**: Claude side panel during a `render_frames` task -- task_id chip + streaming `task_progress` notifications. Catches the spec's killer feature.
 3. **Audit findings**: `audit_acescct_consistency` output rendered as a list in the Claude side panel. Three findings, two green, one yellow. Demonstrates "read-only, never auto-fixes".
-4. **Profile loading**: Claude calling `list_profiles` and the response panel showing all 9. Caption: "9 skill profiles, lazy-loaded."
+4. **Profile loading**: Claude calling `list_profiles` and the response panel showing all 9. Caption: "10 skill profiles, lazy-loaded."
 5. **Optional**: Deep-comp DAG (FLIP_Blood_ss_0170 NetworkBox), to make the deep / FLIP / ZDefocus story visible.
 
 Crop to the working area only -- no stray Slack or browser tabs in the OBS frame.

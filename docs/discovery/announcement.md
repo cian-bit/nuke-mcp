@@ -9,7 +9,7 @@ nuke-mcp v0.2.0 is out.
 
 First DCC MCP server with the MCP 2025-11-25 Tasks primitive: render_frames, train_copycat, bake_smartvector all run as cancellable, persistent, reconnect-safe Tasks.
 
-86 tools, 9 profiles. AOV / deep / OCIO / tracking macros.
+96 tools, 10 profiles. AOV / deep / OCIO / tracking macros.
 
 github.com/cian-bit/nuke-mcp
 ```
@@ -45,7 +45,7 @@ Hi all -- I've been building [nuke-mcp](https://github.com/cian-bit/nuke-mcp), a
 **What's actually new in v0.2.0**:
 
 - **MCP 2025-11-25 Tasks primitive.** First DCC MCP to ship it. `render_frames`, `train_copycat`, and `bake_smartvector` return a task_id, stream `task_progress` notifications, persist state to disk. Cancellable. Survives reconnect.
-- **86 tools across 9 skill profiles.** Default surface is 45 tools (core); specialised profiles load on demand via `load_profile("tracking")`.
+- **96 tools across 10 skill profiles.** Default surface is 45 tools (core); specialised profiles load on demand via `load_profile("tracking")`.
 - **Pydantic v2 structured outputs** at the tool boundary.
 - **AST safety scanner** on `execute_python` -- blocks `nuke.scriptClose`, `os.remove`, write-mode `open()`, and the usual indirection paths (`getattr`, `eval`, `exec`, walrus, `__import__`, etc).
 - **Audit tools** (`audit_acescct_consistency`, `audit_write_paths`, `audit_naming_convention`, `audit_render_settings`) that are strictly read-only.
@@ -74,7 +74,7 @@ This server ships compositing-domain macros: `setup_karma_aov_pipeline` builds a
 
 It's also the first DCC MCP to ship the MCP 2025-11-25 Tasks primitive. Renders, CopyCat training, SmartVector bakes -- all return a task_id, stream progress notifications, persist state to disk, and survive reconnect. The state machine is `working / input_required / completed / failed / cancelled`, file-backed at `~/.nuke_mcp/tasks/<id>.json`.
 
-86 tools across 9 skill profiles, surfaced lazily so the active tool surface stays small. AST safety scanner on `execute_python`. Pydantic v2 structured outputs. 597 tests passing.
+96 tools across 10 skill profiles, surfaced lazily so the active tool surface stays small. AST safety scanner on `execute_python`. Pydantic v2 structured outputs. 597 tests passing.
 
 A few things I learnt building this that might be useful to other DCC-MCP authors:
 
@@ -89,7 +89,7 @@ Repo: <https://github.com/cian-bit/nuke-mcp>. MIT. Feedback welcome -- especiall
 ## Discord / Slack VFX-channel one-liner
 
 ```
-Just shipped nuke-mcp v0.2.0. MCP server for Foundry Nuke with comp-domain macros (AOV / deep / OCIO / tracking) and the MCP 2025-11-25 Tasks primitive (cancellable persistent renders). 86 tools across 9 profiles. https://github.com/cian-bit/nuke-mcp
+Just shipped nuke-mcp v0.2.0. MCP server for Foundry Nuke with comp-domain macros (AOV / deep / OCIO / tracking) and the MCP 2025-11-25 Tasks primitive (cancellable persistent renders). 96 tools across 10 profiles. https://github.com/cian-bit/nuke-mcp
 ```
 
 ## Posting cadence

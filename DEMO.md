@@ -119,7 +119,7 @@ Lower-third captions, one per beat. Bold key term, sub-line for the technical cl
 ```
 nuke-mcp
 Production-grade MCP server for Foundry Nuke
-86 tools | 9 profiles | MCP 2025-11-25 Tasks
+96 tools | 10 profiles | MCP 2025-11-25 Tasks
 github.com/cian-bit/nuke-mcp
 ```
 
