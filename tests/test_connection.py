@@ -519,3 +519,174 @@ def test_probe_executor_uses_four_workers():
     """Houdini-MCP parity: probe pool sized for concurrent callers."""
     pool = connection._get_probe_executor()
     assert pool._max_workers == 4
+
+
+# -- B2: task_progress notification demuxer --
+
+
+class _FakeSocket:
+    """In-memory socket replacement for demuxer tests.
+
+    Feeds the demuxer pre-canned chunks one ``recv`` at a time so we
+    can verify ordering without standing up a real TCP server.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def recv(self, _bufsize: int) -> bytes:
+        if not self._chunks:
+            # Mimic a closed connection -- _recv_json must raise.
+            return b""
+        return self._chunks.pop(0)
+
+
+def test_recv_json_routes_notification_to_queue():
+    """A ``task_progress`` line must land in the notification queue and
+    NOT be returned to the caller. The next real response goes through.
+    """
+    queue = connection.notification_queue()
+    queue.drain()  # clear any prior leftovers from the suite
+    # one chunk with notification + response framed back-to-back.
+    payload = (
+        b'{"type":"task_progress","id":"t1","frame":1}\n'
+        b'{"status":"ok","result":{"ok":true},"_request_id":"abc"}\n'
+    )
+    sock = _FakeSocket([payload])
+    out = connection._recv_json(sock)  # type: ignore[arg-type]
+    assert out["status"] == "ok"
+    drained = queue.drain()
+    assert len(drained) == 1
+    assert drained[0]["id"] == "t1"
+    assert drained[0]["frame"] == 1
+    # buffer cleared for this socket (no trailing partial line).
+    assert id(sock) not in connection._recv_buffers
+
+
+def test_recv_json_stashes_surplus_bytes_for_next_call():
+    """When two response lines arrive in one chunk, the second must be
+    delivered on the next ``_recv_json`` call without another recv.
+    """
+    payload = (
+        b'{"status":"ok","result":{"a":1},"_request_id":"r1"}\n'
+        b'{"status":"ok","result":{"b":2},"_request_id":"r2"}\n'
+    )
+    sock = _FakeSocket([payload])
+    first = connection._recv_json(sock)  # type: ignore[arg-type]
+    assert first["result"] == {"a": 1}
+    # second call: no chunks left in the fake socket, but the parser
+    # must still find the queued frame in the buffer.
+    second = connection._recv_json(sock)  # type: ignore[arg-type]
+    assert second["result"] == {"b": 2}
+
+
+def test_recv_json_drains_multiple_notifications_then_returns_response():
+    """A burst of progress lines followed by a real response: every
+    notification queued, response returned exactly once.
+    """
+    queue = connection.notification_queue()
+    queue.drain()
+    payload = (
+        b'{"type":"task_progress","id":"t1","frame":1}\n'
+        b'{"type":"task_progress","id":"t1","frame":2}\n'
+        b'{"type":"task_progress","id":"t1","frame":3}\n'
+        b'{"status":"ok","result":{"done":true},"_request_id":"r1"}\n'
+    )
+    sock = _FakeSocket([payload])
+    out = connection._recv_json(sock)  # type: ignore[arg-type]
+    assert out["result"] == {"done": True}
+    drained = queue.drain()
+    assert [n["frame"] for n in drained] == [1, 2, 3]
+
+
+def test_recv_json_listener_callback_invoked():
+    """Registered per-task listener intercepts notifications instead of
+    the generic queue.
+    """
+    queue = connection.notification_queue()
+    queue.drain()
+    seen: list[dict] = []
+    queue.register_listener("t42", seen.append)
+    try:
+        payload = (
+            b'{"type":"task_progress","id":"t42","frame":1}\n'
+            b'{"type":"task_progress","id":"t42","frame":2}\n'
+            b'{"status":"ok","result":{},"_request_id":"r"}\n'
+        )
+        sock = _FakeSocket([payload])
+        connection._recv_json(sock)  # type: ignore[arg-type]
+        assert [n["frame"] for n in seen] == [1, 2]
+        # listener consumed them -- queue must be empty.
+        assert queue.drain() == []
+    finally:
+        queue.unregister_listener("t42")
+
+
+def test_recv_json_listener_for_other_task_does_not_intercept():
+    """A listener registered for a different id must not eat someone
+    else's notifications.
+    """
+    queue = connection.notification_queue()
+    queue.drain()
+    seen: list[dict] = []
+    queue.register_listener("other", seen.append)
+    try:
+        payload = (
+            b'{"type":"task_progress","id":"t99","frame":7}\n'
+            b'{"status":"ok","result":{},"_request_id":"r"}\n'
+        )
+        sock = _FakeSocket([payload])
+        connection._recv_json(sock)  # type: ignore[arg-type]
+        assert seen == []  # listener for "other" got nothing
+        drained = queue.drain()
+        assert len(drained) == 1
+        assert drained[0]["id"] == "t99"
+    finally:
+        queue.unregister_listener("other")
+
+
+def test_recv_json_invalid_json_raises():
+    """Bad framing must surface as ConnectionError so we don't silently desync."""
+    sock = _FakeSocket([b"{not valid json}\n"])
+    with pytest.raises(connection.ConnectionError, match="invalid json"):
+        connection._recv_json(sock)  # type: ignore[arg-type]
+
+
+def test_send_with_task_progress_in_flight_returns_real_response(connected, monkeypatch):
+    """End-to-end: while a real send is awaiting its response the addon
+    can interleave task_progress lines on the same socket; ``send``
+    must still return the response cleanly.
+    """
+    server = connected
+    queue = connection.notification_queue()
+    queue.drain()
+
+    real_dispatch = server._dispatch
+
+    def dispatch_with_burst(msg):
+        # Inject a notification on the live socket BEFORE the real
+        # response. The mock server holds the live client socket on
+        # the only connection, so we sneak in a write via the
+        # _handle loop's client. We can't reach it directly here,
+        # so we route through a dispatch hook that emits a side
+        # notification using the queue's put().
+        queue.put({"type": "task_progress", "id": "fake", "frame": 99})
+        return real_dispatch(msg)
+
+    server._dispatch = dispatch_with_burst
+    out = connection.send("get_script_info")
+    assert out["fps"] == 24.0
+    drained = queue.drain()
+    assert any(n.get("frame") == 99 for n in drained)
+
+
+def test_disconnect_clears_recv_buffer(mock_server):
+    """Buffers tracked by socket id must not leak across reconnects."""
+    _, port = mock_server
+    connection.connect("localhost", port)
+    assert connection._sock is not None
+    sid = id(connection._sock)
+    # Plant a fake leftover; disconnect must drop it.
+    connection._recv_buffers[sid] = b"leftover"
+    connection.disconnect()
+    assert sid not in connection._recv_buffers

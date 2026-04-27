@@ -304,6 +304,7 @@ def disconnect() -> None:
     global _sock, _nuke_version
     _stop_heartbeat()
     if _sock is not None:
+        _drop_recv_buffer(_sock)
         with contextlib.suppress(OSError):
             _sock.close()
         _sock = None
@@ -629,18 +630,141 @@ def _send_json(s: socket.socket, data: dict[str, Any]) -> None:
     s.sendall(payload + b"\n")
 
 
+# Per-socket recv buffer. The wire is line-delimited but a single TCP
+# read can land multiple framed lines at once -- the old single-call
+# ``buf`` discarded everything after the first newline, which is fine
+# for pure request/response but breaks B2's task_progress
+# notifications interleaved on the same socket. Keying on ``id(sock)``
+# is good enough: ``socket`` objects aren't hashable on every Python
+# but ``id`` is stable for a live socket and the dict gets cleared on
+# disconnect.
+_recv_buffers: dict[int, bytes] = {}
+
+
+def _drop_recv_buffer(s: socket.socket | None) -> None:
+    if s is None:
+        return
+    _recv_buffers.pop(id(s), None)
+
+
 def _recv_json(s: socket.socket) -> dict[str, Any]:
-    buf = b""
+    """Read one response line, draining any ``task_progress`` notifications.
+
+    Notification lines (``type=="task_progress"`` with no
+    ``_request_id``) are routed to the global :class:`_NotificationQueue`
+    and the loop continues. The first line that isn't a notification is
+    returned to the caller.
+
+    Buffering is per-socket: if a single ``recv`` lands multiple
+    newline-delimited frames, the surplus bytes wait in ``_recv_buffers``
+    so the next call can pick them up instead of blocking on more data.
+    """
+    sock_id = id(s)
+    buf = _recv_buffers.pop(sock_id, b"")
     while True:
+        # Drain any complete frames already sitting in the buffer
+        # before issuing another recv. Keeps notification routing
+        # tight when bursts arrive in a single chunk.
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError as exc:
+                # A malformed frame is a hard wire-format violation;
+                # surface it instead of silently desyncing.
+                _recv_buffers[sock_id] = buf
+                raise ConnectionError(f"invalid json from addon: {exc}") from exc
+            if _is_notification(msg):
+                _notification_queue.put(msg)
+                continue
+            if buf:
+                _recv_buffers[sock_id] = buf
+            else:
+                _recv_buffers.pop(sock_id, None)
+            return msg
+
         try:
             chunk = s.recv(4096)
         except TimeoutError as e:
+            # Stash whatever partial bytes we hold so the next call
+            # doesn't lose them. The connection is still live -- the
+            # caller decides whether to retry or reconnect.
+            _recv_buffers[sock_id] = buf
             raise ConnectionError("recv timed out") from e
         if not chunk:
+            _recv_buffers.pop(sock_id, None)
             raise ConnectionError("connection closed by Nuke")
         buf += chunk
         if len(buf) > MAX_MSG_SIZE:
+            _recv_buffers.pop(sock_id, None)
             raise ConnectionError(f"response too large: {len(buf)} bytes")
-        if b"\n" in buf:
-            line, _ = buf.split(b"\n", 1)
-            return json.loads(line)
+
+
+def _is_notification(msg: dict[str, Any]) -> bool:
+    """A line is a notification if it carries ``type=='task_progress'``.
+
+    The addon emits these out-of-band from worker threads (B2 commit 4)
+    so they have no ``_request_id`` to match a pending send. The
+    explicit ``type`` check keeps the demuxer robust against future
+    notification kinds -- add the new type to the disjunction here.
+    """
+    return msg.get("type") == "task_progress"
+
+
+# -- notification queue --
+
+
+class _NotificationQueue:
+    """In-memory fan-out for addon-emitted notifications.
+
+    The queue holds notifications by ``id`` so callers that registered
+    a listener for a specific task get only their stream. A catch-all
+    ``drain()`` returns every queued notification regardless of
+    listener state.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queued: list[dict[str, Any]] = []
+        self._listeners: dict[str, Callable[[dict[str, Any]], None]] = {}
+
+    def put(self, notif: dict[str, Any]) -> None:
+        """Route a notification to its listener or queue it.
+
+        Listener callbacks are invoked under the queue lock to keep
+        ordering deterministic. If a listener raises, the exception is
+        logged and the notification falls through to the queue so
+        callers can still inspect it via ``drain``.
+        """
+        with self._lock:
+            cb = self._listeners.get(str(notif.get("id", "")))
+            if cb is not None:
+                try:
+                    cb(notif)
+                    return
+                except Exception:
+                    log.exception("task_progress listener raised; queueing instead")
+            self._queued.append(notif)
+
+    def drain(self) -> list[dict[str, Any]]:
+        with self._lock:
+            out, self._queued = self._queued, []
+            return out
+
+    def register_listener(self, task_id: str, callback: Callable[[dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._listeners[task_id] = callback
+
+    def unregister_listener(self, task_id: str) -> None:
+        with self._lock:
+            self._listeners.pop(task_id, None)
+
+
+_notification_queue = _NotificationQueue()
+
+
+def notification_queue() -> _NotificationQueue:
+    """Public accessor for the module-level notification queue."""
+    return _notification_queue
