@@ -126,6 +126,17 @@ PROFILES: dict[str, list[str]] = {
         "create_deep_transform",
         "deep_to_image",
     ],
+    # C9 audit + QC tools. Read-only scans plus one BENIGN_NEW QC
+    # builder (qc_viewer_pair). audit_acescct_consistency is the C2
+    # colour module's owned slot; the wrapper here delegates when C2
+    # is present and returns a degraded payload otherwise.
+    "audit": [
+        "audit_acescct_consistency",
+        "audit_write_paths",
+        "audit_naming_convention",
+        "audit_render_settings",
+        "qc_viewer_pair",
+    ],
 }
 
 
@@ -142,6 +153,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "aov": "AOV merge / Karma EXR layer recombination.",
     "tracking": "2D + 3D tracking and camera-solve primitives.",
     "deep": "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.).",
+    "audit": (
+        "Read-only QC scans (write paths, naming, render settings, "
+        "ACEScct consistency) plus a Switch+Grade visual-diff builder."
+    ),
 }
 
 

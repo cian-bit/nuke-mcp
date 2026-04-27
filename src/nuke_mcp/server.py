@@ -20,6 +20,7 @@ from fastmcp import FastMCP
 from nuke_mcp import connection
 from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
 from nuke_mcp.tools import (
+    audit,
     channels,
     code,
     comp,
@@ -88,6 +89,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     digest.register(ctx)
     tracking.register(ctx)
     deep.register(ctx)
+    audit.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 
