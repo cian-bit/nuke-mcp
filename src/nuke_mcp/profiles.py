@@ -126,6 +126,13 @@ PROFILES: dict[str, list[str]] = {
         "create_deep_transform",
         "deep_to_image",
     ],
+    # C4 distortion / STMap envelope + SmartVector propagate.
+    "distortion": [
+        "bake_lens_distortion_envelope",
+        "apply_idistort",
+        "apply_smartvector_propagate",
+        "generate_stmap",
+    ],
 }
 
 
@@ -142,6 +149,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "aov": "AOV merge / Karma EXR layer recombination.",
     "tracking": "2D + 3D tracking and camera-solve primitives.",
     "deep": "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.).",
+    "distortion": (
+        "Lens-distortion / STMap envelope + SmartVector propagate. "
+        "Wraps comps in undistorted-linear, bakes vectors as Tasks."
+    ),
 }
 
 
