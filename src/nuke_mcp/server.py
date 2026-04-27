@@ -20,6 +20,7 @@ from fastmcp import FastMCP
 from nuke_mcp import connection
 from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
 from nuke_mcp.tools import (
+    aov,
     channels,
     code,
     color,
@@ -90,6 +91,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     tracking.register(ctx)
     deep.register(ctx)
     color.register(ctx)
+    aov.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 

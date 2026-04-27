@@ -2622,6 +2622,334 @@ def _handle_create_ocio_colorspace(params: dict) -> dict:
     return _node_ref(cs)
 
 
+# C3 AOV / channel rebuild handlers
+#
+# Karma multi-channel EXRs ship every render path packed into one file:
+# beauty plus diffuse_direct / diffuse_indirect / specular_direct /
+# specular_indirect / sss / transmission / emission / volume plus utility
+# layers (P, N, depth, motion) and one or more cryptomatte slots.
+#
+# ``detect_aov_layers`` reads ``Read.metadata()`` ``exr/*`` keys and
+# ``Read.channels()`` to surface which layers actually live in the EXR.
+# ``setup_karma_aov_pipeline`` then builds the full split-and-rebuild
+# graph plus a QC viewer pair so the comp can verify the recombine
+# matches the original beauty.
+# ---------------------------------------------------------------------------
+
+# Canonical Karma AOV layers in priority/build order. Layers absent from
+# the source EXR are silently skipped; layers in the EXR but absent
+# from this list surface under ``unknown_layers`` in the result so the
+# caller can detect AOV-name drift.
+_KARMA_AOV_LAYERS: tuple[str, ...] = (
+    "rgba",  # beauty -- the merge base
+    "diffuse_direct",
+    "diffuse_indirect",
+    "specular_direct",
+    "specular_indirect",
+    "sss",
+    "transmission",
+    "emission",
+    "volume",
+    "P",
+    "N",
+    "depth",
+    "motion",
+    # cryptomattes are detected dynamically (cryptomatte_*)
+)
+
+# Layers that sum into the beauty reconstruction (the ``Merge plus``
+# chain). Utility layers (P, N, depth, motion, cryptomattes) get their
+# own Shuffles but are NOT additively merged -- they're metadata
+# passes, not light components.
+_KARMA_LIGHT_LAYERS: frozenset[str] = frozenset(
+    {
+        "diffuse_direct",
+        "diffuse_indirect",
+        "specular_direct",
+        "specular_indirect",
+        "sss",
+        "transmission",
+        "emission",
+        "volume",
+    }
+)
+
+
+def _parse_layers_from_channels(channels: list[str]) -> dict[str, list[str]]:
+    """Bucket flat channel names into ``{layer: [channel, ...]}``.
+
+    ``Read.channels()`` returns flat strings like ``"rgba.red"`` or
+    ``"depth.z"``; we split on the rightmost dot so a layer that
+    happens to contain a dot (rare but legal in EXR) survives intact.
+    Channels with no dot land under ``"main"``.
+    """
+    out: dict[str, list[str]] = {}
+    for ch in channels:
+        if "." in ch:
+            layer, _, channel = ch.rpartition(".")
+        else:
+            layer, channel = "main", ch
+        out.setdefault(layer, []).append(channel)
+    return out
+
+
+def _detect_karma_layers(read_node: Any) -> dict[str, Any]:
+    """Pull layer / format / per-layer-channels off a Read node.
+
+    Shared between ``_handle_detect_aov_layers`` (the read-only tool)
+    and ``_handle_setup_karma_aov_pipeline`` (so the workflow tool
+    doesn't have to round-trip through the addon a second time).
+    """
+    channels = list(read_node.channels())
+    channels_per_layer = _parse_layers_from_channels(channels)
+
+    # Layer order: canonical Karma list first (so the rebuild graph
+    # stays predictable), then any layer in the EXR but not in the
+    # canonical list, sorted for determinism.
+    found = set(channels_per_layer.keys())
+    ordered_layers: list[str] = [layer for layer in _KARMA_AOV_LAYERS if layer in found]
+    cryptomattes = sorted(
+        layer for layer in found if layer.startswith("cryptomatte") and layer not in ordered_layers
+    )
+    ordered_layers.extend(cryptomattes)
+    leftovers = sorted(found - set(ordered_layers))
+    ordered_layers.extend(leftovers)
+
+    fmt = ""
+    fmt_knob = read_node.knob("format") if hasattr(read_node, "knob") else None
+    if fmt_knob is not None:
+        with contextlib.suppress(Exception):
+            fmt = str(fmt_knob.value())
+
+    return {
+        "layers": ordered_layers,
+        "format": fmt,
+        "channels_per_layer": channels_per_layer,
+    }
+
+
+def _handle_detect_aov_layers(params: dict) -> dict:
+    """Inspect ``Read.metadata()`` + ``Read.channels()`` for AOV layers."""
+    import nuke  # noqa: F401  -- pulled in for the addon import side-effects
+
+    read_name = params["read_node"]
+    src = _resolve_node(read_name)
+    if src is None:
+        raise ValueError(f"node not found: {read_name}")
+    if src.Class() != "Read":
+        raise ValueError(f"node '{read_name}' is class '{src.Class()}', expected Read")
+    return _detect_karma_layers(src)
+
+
+def _handle_setup_karma_aov_pipeline(params: dict) -> dict:
+    """Build the Shuffle-per-layer + reconstruction Merge + QC pipeline.
+
+    Layout: a Read at the supplied ``read_path`` (re-used if present),
+    one Shuffle per detected AOV layer, an additive ``Merge2 plus``
+    chain over the light layers (rebuilds beauty), a ``Remove
+    keep=rgba`` cleanup, and a QC viewer pair: a Switch between the
+    original beauty and the rebuilt beauty + a diff Grade gain=10 to
+    amplify mismatches. Everything wraps in a Group named
+    ``KarmaAOV_<shot>`` (or the ``name`` kwarg).
+
+    Idempotent on ``name``: re-calling with the same name returns the
+    existing Group's NodeRef without rebuilding.
+    """
+    import nuke
+
+    read_path = params["read_path"]
+    if not isinstance(read_path, str) or not read_path:
+        raise ValueError("read_path must be a non-empty string")
+    explicit_name = params.get("name")
+
+    # Idempotent: if the named Group already exists, return its ref.
+    if explicit_name:
+        existing = nuke.toNode(explicit_name)
+        if existing is not None:
+            if existing.Class() != "Group":
+                raise ValueError(
+                    f"node '{explicit_name}' exists but is class "
+                    f"'{existing.Class()}', expected 'Group'"
+                )
+            return _node_ref(existing)
+
+    # Re-use a Read with the same path before creating a fresh one --
+    # avoids stacking duplicate Reads on repeated calls when ``name`` is
+    # not supplied.
+    read_node = None
+    for candidate in nuke.allNodes("Read"):
+        try:
+            if candidate["file"].value() == read_path:
+                read_node = candidate
+                break
+        except Exception:
+            continue
+    if read_node is None:
+        read_node = nuke.nodes.Read()
+        read_node["file"].setValue(read_path)
+
+    detection = _detect_karma_layers(read_node)
+    layers: list[str] = detection["layers"]
+    rebuild_layers = [layer for layer in layers if layer in _KARMA_LIGHT_LAYERS]
+    unknown_layers = [
+        layer
+        for layer in layers
+        if layer not in _KARMA_AOV_LAYERS
+        and not layer.startswith("cryptomatte")
+        and layer not in {"rgba", "main"}
+    ]
+
+    # Sub-graph nodes (collected so we can wrap into a Group). Build
+    # outside the Group first then stuff into one -- ``nuke.collapseToGroup``
+    # is the canonical wrap-after-build path.
+    shuffles: list[Any] = []
+    base_x = read_node.xpos()
+    base_y = read_node.ypos()
+    for i, layer in enumerate(layers):
+        sh = nuke.nodes.Shuffle()
+        sh.setInput(0, read_node)
+        if sh.knob("in"):
+            with contextlib.suppress(Exception):
+                sh["in"].setValue(layer)
+        if sh.knob("out"):
+            with contextlib.suppress(Exception):
+                sh["out"].setValue("rgba")
+        sh.setXYpos(base_x + (i + 1) * 110, base_y + 80)
+        shuffles.append(sh)
+
+    # Reconstruction Merge: start from the beauty Shuffle (or the Read
+    # if no beauty layer detected) and additively plus every light
+    # layer. ``operation=plus`` is what additive AOV recombine needs.
+    rgba_shuffle = next(
+        (sh for sh, layer in zip(shuffles, layers, strict=False) if layer == "rgba"),
+        None,
+    )
+    base = rgba_shuffle if rgba_shuffle is not None else read_node
+    merges: list[Any] = []
+    for layer in rebuild_layers:
+        sh = next((s for s, lyr in zip(shuffles, layers, strict=False) if lyr == layer), None)
+        if sh is None:
+            continue
+        merge = nuke.nodes.Merge2()
+        if merge.knob("operation"):
+            with contextlib.suppress(Exception):
+                merge["operation"].setValue("plus")
+        merge.setInput(0, base)  # B input
+        merge.setInput(1, sh)  # A input
+        merge.setXYpos(base_x, base_y + 200 + len(merges) * 60)
+        merges.append(merge)
+        base = merge
+
+    # ``Remove keep=rgba`` strips utility channels off the rebuilt
+    # beauty -- downstream tools shouldn't see depth / cryptomatte
+    # leaking through after the recombine.
+    remove = nuke.nodes.Remove()
+    if remove.knob("operation"):
+        with contextlib.suppress(Exception):
+            remove["operation"].setValue("keep")
+    if remove.knob("channels"):
+        with contextlib.suppress(Exception):
+            remove["channels"].setValue("rgba")
+    remove.setInput(0, base)
+    remove.setXYpos(base_x, base_y + 200 + (len(merges) + 1) * 60)
+
+    # QC viewer pair: Switch toggles between the original beauty
+    # (``rgba`` Shuffle if present, else the Read) and the rebuilt
+    # beauty so the comper can A/B them. The diff path goes
+    # original -> Merge difference vs rebuild -> Grade multiply=10 so
+    # any reconstruction error pops visibly in the viewer.
+    qc_switch = nuke.nodes.Switch()
+    qc_switch.setInput(0, rgba_shuffle if rgba_shuffle is not None else read_node)
+    qc_switch.setInput(1, remove)
+    qc_switch.setXYpos(base_x + 220, base_y + 320)
+
+    qc_diff = nuke.nodes.Merge2()
+    if qc_diff.knob("operation"):
+        with contextlib.suppress(Exception):
+            qc_diff["operation"].setValue("difference")
+    qc_diff.setInput(0, rgba_shuffle if rgba_shuffle is not None else read_node)
+    qc_diff.setInput(1, remove)
+    qc_diff.setXYpos(base_x + 440, base_y + 320)
+
+    qc_grade = nuke.nodes.Grade()
+    if qc_grade.knob("multiply"):
+        with contextlib.suppress(Exception):
+            qc_grade["multiply"].setValue(10.0)
+    qc_grade.setInput(0, qc_diff)
+    qc_grade.setXYpos(base_x + 440, base_y + 380)
+
+    # Wrap the whole sub-graph (read + shuffles + merges + remove + QC
+    # nodes) into a Group. Use ``nuke.selectAll() / nuke.collapseToGroup()``
+    # via the selection -- there isn't a direct API on the Node object.
+    nuke.selectAll()
+    for n in nuke.allNodes():
+        n.setSelected(False)
+    sub_nodes = [read_node, *shuffles, *merges, remove, qc_switch, qc_diff, qc_grade]
+    for n in sub_nodes:
+        n.setSelected(True)
+    group = nuke.collapseToGroup()
+    if group is None:
+        # Older Nuke or a build without ``collapseToGroup`` -- fall
+        # back to a freshly-created Group node, no children inside.
+        group = nuke.nodes.Group()
+    if explicit_name:
+        group.setName(explicit_name)
+    elif group.Class() == "Group":
+        # Default shot name: try to pull a stem from the read path.
+        stem = os.path.basename(read_path).split(".")[0] or "shot"
+        group.setName(f"KarmaAOV_{stem}")
+
+    ref = _node_ref(group)
+    ref["layers"] = list(layers)
+    ref["unknown_layers"] = unknown_layers
+    ref["rebuild_layers"] = list(rebuild_layers)
+    return ref
+
+
+def _handle_setup_aov_merge(params: dict) -> dict:
+    """Additively merge N pre-split AOV Read nodes into one beauty.
+
+    Migrated from the f-string ``execute_python`` blob in
+    ``tools/channels.py``; same semantics, but typed: the addon
+    receives the resolved name list and validates each input
+    individually so the error envelope surfaces missing nodes
+    cleanly.
+    """
+    import nuke
+
+    raw_names = params.get("read_nodes")
+    if not isinstance(raw_names, list) or not raw_names:
+        raise ValueError("read_nodes must be a non-empty list of Read node names")
+    if len(raw_names) < 2:
+        raise ValueError("setup_aov_merge needs at least 2 Read nodes to merge")
+
+    nodes: list[Any] = []
+    for n in raw_names:
+        node = _resolve_node(n) if isinstance(n, str) else None
+        if node is None:
+            raise ValueError(f"node not found: {n}")
+        nodes.append(node)
+
+    prev = nodes[0]
+    merges: list[str] = []
+    for i in range(1, len(nodes)):
+        m = nuke.nodes.Merge2()
+        if m.knob("operation"):
+            with contextlib.suppress(Exception):
+                m["operation"].setValue("plus")
+        # B = prev (running merge), A = next AOV Read
+        m.setInput(1, prev)
+        m.setInput(0, nodes[i])
+        prev = m
+        merges.append(m.name())
+
+    return {
+        "merges": merges,
+        "final": merges[-1] if merges else None,
+        "inputs": [n.name() for n in nodes],
+    }
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -2683,4 +3011,8 @@ HANDLERS: dict[str, Any] = {
     "audit_acescct_consistency": _handle_audit_acescct_consistency,
     "convert_node_colorspace": _handle_convert_node_colorspace,
     "create_ocio_colorspace": _handle_create_ocio_colorspace,
+    # C3 AOV / channel rebuild
+    "detect_aov_layers": _handle_detect_aov_layers,
+    "setup_karma_aov_pipeline": _handle_setup_karma_aov_pipeline,
+    "setup_aov_merge": _handle_setup_aov_merge,
 }

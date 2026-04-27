@@ -74,6 +74,9 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     # channels.py
     "list_channels": READ_ONLY,
     "shuffle_channels": BENIGN_NEW,
+    # aov.py (C3) -- setup_aov_merge migrated here from channels.py
+    "detect_aov_layers": READ_ONLY,
+    "setup_karma_aov_pipeline": BENIGN_NEW,
     "setup_aov_merge": BENIGN_NEW,
     # viewer.py
     "view_node": BENIGN_NEW,
@@ -254,6 +257,7 @@ def test_all_setup_tools_advertise_benign_new(all_tools: list) -> None:
         "setup_denoise",
         "setup_write",
         "setup_aov_merge",
+        "setup_karma_aov_pipeline",
     )
     for name in new_node_setups:
         hints = _hint_dict(by_name[name].annotations)

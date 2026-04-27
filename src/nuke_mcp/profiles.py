@@ -111,8 +111,11 @@ PROFILES: dict[str, list[str]] = {
         "convert_node_colorspace",
         "create_ocio_colorspace",
     ],
-    # AOV merge / Karma EXR layer recombine.
+    # AOV merge / Karma EXR layer recombine. C3 added detect_aov_layers
+    # + setup_karma_aov_pipeline alongside the legacy setup_aov_merge.
     "aov": [
+        "detect_aov_layers",
+        "setup_karma_aov_pipeline",
         "setup_aov_merge",
     ],
     # 2D + 3D tracking primitives.

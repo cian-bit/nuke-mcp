@@ -1,4 +1,9 @@
-"""Tests for channels.py: list_channels / shuffle_channels / setup_aov_merge.
+"""Tests for channels.py: list_channels / shuffle_channels.
+
+C3 migrated ``setup_aov_merge`` to ``tools/aov.py`` alongside the new
+``detect_aov_layers`` and ``setup_karma_aov_pipeline`` tools.
+``test_aov.py`` covers the migrated tool plus the new pipeline. Tests
+in this file no longer touch ``setup_aov_merge``.
 
 # A3: rewrite this module's assertions when channels.py migrates to typed handlers.
 """
@@ -106,36 +111,6 @@ def test_shuffle_channels_depth_to_alpha(channel_tools):
 
 
 # ---------------------------------------------------------------------------
-# setup_aov_merge  (string-injection, comma-split)
+# setup_aov_merge migrated to tools/aov.py in Phase C3 -- coverage lives
+# in tests/test_aov.py now. This module no longer references it.
 # ---------------------------------------------------------------------------
-
-
-def test_setup_aov_merge_two_reads(channel_tools):
-    server, _script, tools = channel_tools
-    tools["setup_aov_merge"]("diffuse,specular")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when channels.py migrates to typed handlers.
-    assert "'diffuse'" in code
-    assert "'specular'" in code
-    assert "Merge2" in code
-    assert "plus" in code  # additive merge default (double-quoted in source)
-
-
-def test_setup_aov_merge_three_reads(channel_tools):
-    server, _script, tools = channel_tools
-    tools["setup_aov_merge"]("diffuse,specular,emission")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when channels.py migrates to typed handlers.
-    for name in ["diffuse", "specular", "emission"]:
-        assert f"'{name}'" in code
-
-
-def test_setup_aov_merge_strips_whitespace(channel_tools):
-    """Comma split should trim whitespace -- locking in current behaviour."""
-    server, _script, tools = channel_tools
-    tools["setup_aov_merge"]("diffuse , specular ")
-    code = server.executed_code[0]
-    # # A3: rewrite this assertion when channels.py migrates to typed handlers.
-    # whitespace stripped before names land in the payload list literal
-    assert "'diffuse'" in code
-    assert "'specular'" in code

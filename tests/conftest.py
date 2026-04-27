@@ -975,6 +975,10 @@ class MockNukeServer:
             "audit_acescct_consistency": self._audit_acescct_consistency,
             "convert_node_colorspace": self._convert_node_colorspace,
             "create_ocio_colorspace": self._create_ocio_colorspace,
+            # C3 AOV / channel rebuild
+            "detect_aov_layers": self._detect_aov_layers,
+            "setup_karma_aov_pipeline": self._setup_karma_aov_pipeline,
+            "setup_aov_merge": self._setup_aov_merge,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -2052,6 +2056,252 @@ class MockNukeServer:
             knobs={"in_colorspace": in_cs, "out_colorspace": out_cs},
         )
         return self._node_ref_from_state(new_name)
+
+    # ------------------------------------------------------------------
+    # C3 AOV / channel rebuild handlers
+    #
+    # The mock parses the same canonical Karma layer list as the real
+    # addon and exposes ``aov_layers`` / ``aov_format`` on each
+    # ``self.nodes`` entry so tests can pre-seed exactly which layers a
+    # Read claims to carry.
+    # ------------------------------------------------------------------
+
+    _KARMA_AOV_LAYERS: tuple[str, ...] = (
+        "rgba",
+        "diffuse_direct",
+        "diffuse_indirect",
+        "specular_direct",
+        "specular_indirect",
+        "sss",
+        "transmission",
+        "emission",
+        "volume",
+        "P",
+        "N",
+        "depth",
+        "motion",
+    )
+
+    _KARMA_LIGHT_LAYERS: frozenset[str] = frozenset(
+        {
+            "diffuse_direct",
+            "diffuse_indirect",
+            "specular_direct",
+            "specular_indirect",
+            "sss",
+            "transmission",
+            "emission",
+            "volume",
+        }
+    )
+
+    def _ordered_layers(self, found: set[str]) -> list[str]:
+        ordered: list[str] = [layer for layer in self._KARMA_AOV_LAYERS if layer in found]
+        cryptos = sorted(
+            layer for layer in found if layer.startswith("cryptomatte") and layer not in ordered
+        )
+        ordered.extend(cryptos)
+        leftovers = sorted(found - set(ordered))
+        ordered.extend(leftovers)
+        return ordered
+
+    def _detect_aov_layers(self, p: dict) -> dict:
+        self.typed_calls.append(("detect_aov_layers", dict(p)))
+        read_node = p["read_node"]
+        if read_node not in self.nodes:
+            raise ValueError(f"node not found: {read_node}")
+        node = self.nodes[read_node]
+        if node["type"] != "Read":
+            raise ValueError(f"node '{read_node}' is class '{node['type']}', expected Read")
+        # Default channel set: rgba only. Tests opt in by setting
+        # ``aov_channels_per_layer`` on the node entry.
+        channels_per_layer: dict[str, list[str]] = node.get(
+            "aov_channels_per_layer",
+            {"rgba": ["red", "green", "blue", "alpha"]},
+        )
+        layers = self._ordered_layers(set(channels_per_layer.keys()))
+        fmt = node.get("aov_format", node.get("knobs", {}).get("format", ""))
+        return {
+            "layers": layers,
+            "format": fmt,
+            "channels_per_layer": channels_per_layer,
+        }
+
+    def _setup_karma_aov_pipeline(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_karma_aov_pipeline", dict(p)))
+        read_path = p["read_path"]
+        if not isinstance(read_path, str) or not read_path:
+            raise ValueError("read_path must be a non-empty string")
+        explicit_name = p.get("name")
+
+        if explicit_name and explicit_name in self.nodes:
+            existing = self.nodes[explicit_name]
+            if existing["type"] != "Group":
+                raise ValueError(
+                    f"node '{explicit_name}' exists but is class "
+                    f"'{existing['type']}', expected 'Group'"
+                )
+            return self._node_ref_from_state(explicit_name)
+
+        # Re-use a Read with the same path before creating one. Otherwise
+        # mint a fresh Read, copy any pre-seeded layer dictionary off the
+        # ``aov_template`` if the test set one (so we don't have to push
+        # path-keyed metadata through a handshake).
+        read_name: str | None = None
+        for n, data in self.nodes.items():
+            if data["type"] == "Read" and data.get("knobs", {}).get("file") == read_path:
+                read_name = n
+                break
+        if read_name is None:
+            read_name = self._register_node(
+                "Read",
+                None,
+                "Read1",
+                [],
+                knobs={"file": read_path},
+            )
+            template = getattr(self, "aov_template_layers", None)
+            if template is not None:
+                self.nodes[read_name]["aov_channels_per_layer"] = dict(template)
+                self.nodes[read_name]["aov_format"] = getattr(self, "aov_template_format", "")
+
+        # Detect off the Read.
+        detection = self._detect_aov_layers({"read_node": read_name})
+        # The above appended a typed_calls entry; pop it so the test
+        # only sees the workflow tool's own call shape.
+        if self.typed_calls and self.typed_calls[-1][0] == "detect_aov_layers":
+            self.typed_calls.pop()
+
+        layers: list[str] = detection["layers"]
+        rebuild_layers = [layer for layer in layers if layer in self._KARMA_LIGHT_LAYERS]
+        unknown_layers = [
+            layer
+            for layer in layers
+            if layer not in self._KARMA_AOV_LAYERS
+            and not layer.startswith("cryptomatte")
+            and layer not in {"rgba", "main"}
+        ]
+
+        # Sub-graph nodes -- build them as flat entries pointing at the
+        # Read, mirroring the addon's structure tightly enough that
+        # tests can count node types.
+        shuffles: list[str] = []
+        for layer in layers:
+            sh_name = self._register_node(
+                "Shuffle",
+                None,
+                "Shuffle1",
+                [read_name],
+                knobs={"in": layer, "out": "rgba"},
+            )
+            shuffles.append(sh_name)
+        # Map layer -> shuffle name for the merge chain.
+        layer_to_shuffle = dict(zip(layers, shuffles, strict=False))
+
+        base = layer_to_shuffle.get("rgba", read_name)
+        merges: list[str] = []
+        for layer in rebuild_layers:
+            sh_name = layer_to_shuffle.get(layer)
+            if sh_name is None:
+                continue
+            merge_name = self._register_node(
+                "Merge2",
+                None,
+                "Merge1",
+                [sh_name, base],
+                knobs={"operation": "plus"},
+            )
+            merges.append(merge_name)
+            base = merge_name
+
+        remove_name = self._register_node(
+            "Remove",
+            None,
+            "Remove1",
+            [base],
+            knobs={"operation": "keep", "channels": "rgba"},
+        )
+
+        switch_input_a = layer_to_shuffle.get("rgba", read_name)
+        switch_name = self._register_node(
+            "Switch",
+            None,
+            "Switch1",
+            [switch_input_a, remove_name],
+        )
+        diff_name = self._register_node(
+            "Merge2",
+            None,
+            "Merge1",
+            [switch_input_a, remove_name],
+            knobs={"operation": "difference"},
+        )
+        grade_name = self._register_node(
+            "Grade",
+            None,
+            "Grade1",
+            [diff_name],
+            knobs={"multiply": 10.0},
+        )
+
+        sub_nodes = [
+            read_name,
+            *shuffles,
+            *merges,
+            remove_name,
+            switch_name,
+            diff_name,
+            grade_name,
+        ]
+
+        if explicit_name:
+            group_name = explicit_name
+        else:
+            stem = read_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].split(".")[0] or "shot"
+            group_name = self._next_unique_name(f"KarmaAOV_{stem}")
+        group_name = self._register_node(
+            "Group",
+            group_name,
+            group_name,
+            [],
+            knobs={"_aov_children": list(sub_nodes)},
+        )
+
+        ref = self._node_ref_from_state(group_name)
+        ref["layers"] = list(layers)
+        ref["unknown_layers"] = unknown_layers
+        ref["rebuild_layers"] = list(rebuild_layers)
+        return ref
+
+    def _setup_aov_merge(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_aov_merge", dict(p)))
+        raw_names = p.get("read_nodes")
+        if not isinstance(raw_names, list) or not raw_names:
+            raise ValueError("read_nodes must be a non-empty list of Read node names")
+        if len(raw_names) < 2:
+            raise ValueError("setup_aov_merge needs at least 2 Read nodes to merge")
+        for n in raw_names:
+            if not isinstance(n, str) or n not in self.nodes:
+                raise ValueError(f"node not found: {n}")
+
+        prev = raw_names[0]
+        merges: list[str] = []
+        for i in range(1, len(raw_names)):
+            merge_name = self._register_node(
+                "Merge2",
+                None,
+                "Merge1",
+                [raw_names[i], prev],
+                knobs={"operation": "plus"},
+            )
+            merges.append(merge_name)
+            prev = merge_name
+
+        return {
+            "merges": merges,
+            "final": merges[-1] if merges else None,
+            "inputs": list(raw_names),
+        }
 
 
 @pytest.fixture(autouse=True)
