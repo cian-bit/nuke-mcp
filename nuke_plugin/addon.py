@@ -1259,22 +1259,137 @@ def _handle_setup_denoise(params: dict) -> dict:
     return {"name": dn.name(), "type": dn.Class()}
 
 
+# Windows-reserved device basenames -- a path whose final segment matches
+# one of these (case-insensitive, with or without an extension) refers to
+# a device, not a file. Writing to ``CON``, ``PRN`` etc. has historically
+# been a hang/crash source on Windows.
+_WIN_RESERVED_DEVICES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+class PathPolicyViolation(ValueError):
+    """Raised when a write path fails the policy check.
+
+    Carries an ``error_class`` attribute so the wire envelope surfaces
+    ``PathPolicyViolation`` rather than the generic ``ValueError`` from
+    the addon's exception path.
+    """
+
+    error_class = "PathPolicyViolation"
+
+
+def _allowed_write_roots() -> list[str]:
+    """Return the list of absolute roots a setup_write path may live under.
+
+    Defaults to the user's home directory plus the ``$SS`` (Salt Spill
+    sandbox) env var if set. ``NUKE_MCP_WRITE_ROOTS`` (semicolon- or
+    os.pathsep-separated) overrides the defaults entirely.
+
+    Empty / missing env values are skipped so a missing ``$SS`` doesn't
+    silently widen the allow-list.
+    """
+    roots: list[str] = []
+    override = os.environ.get("NUKE_MCP_WRITE_ROOTS")
+    if override:
+        roots = [r.strip() for r in override.replace(";", os.pathsep).split(os.pathsep)]
+        return [os.path.normcase(os.path.normpath(r)) for r in roots if r]
+
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        roots.append(home)
+    ss = os.environ.get("SS")
+    if ss:
+        roots.append(ss)
+    return [os.path.normcase(os.path.normpath(r)) for r in roots]
+
+
+def _validate_write_path(path: object) -> str:
+    """Apply the setup_write path policy. Returns the (resolved) path.
+
+    Rejects:
+      * non-string inputs
+      * traversal (``..`` segment)
+      * UNC paths (``\\\\server\\share\\...``)
+      * Windows reserved device basenames (CON, PRN, NUL, COM1, ...)
+      * absolute paths that don't live under any allow-listed root
+
+    Raises PathPolicyViolation on any violation. Relative paths are
+    accepted unconditionally -- they resolve under the script's current
+    working directory inside Nuke, which is the user's choice.
+    """
+    if not isinstance(path, str) or not path:
+        raise PathPolicyViolation("invalid path: must be a non-empty string")
+
+    # Expand ~ first so the absolute-path check sees the resolved form.
+    expanded = os.path.expanduser(path)
+
+    # Traversal: any ``..`` component (cross-platform). Rejecting on the
+    # raw split catches both forward- and back-slash forms.
+    parts = expanded.replace("\\", "/").split("/")
+    if any(p == ".." for p in parts):
+        raise PathPolicyViolation("invalid path: path traversal not permitted")
+
+    # UNC: ``\\server\share\...`` or ``//server/share/...``.
+    if expanded.startswith("\\\\") or expanded.startswith("//"):
+        raise PathPolicyViolation(
+            "invalid path: UNC paths not permitted (network share writes blocked)"
+        )
+
+    # Windows reserved devices: check the final basename without extension.
+    base = os.path.basename(expanded)
+    if base:
+        stem = base.split(".", 1)[0].upper()
+        if stem in _WIN_RESERVED_DEVICES:
+            raise PathPolicyViolation(
+                f"invalid path: Windows reserved device name '{stem}' not permitted"
+            )
+
+    # Absolute-path allow-list. Relative paths skip this check.
+    if os.path.isabs(expanded):
+        normalized = os.path.normcase(os.path.normpath(expanded))
+        roots = _allowed_write_roots()
+        if not roots:
+            raise PathPolicyViolation(
+                "invalid path: absolute writes blocked (no allow-listed roots; "
+                "set NUKE_MCP_WRITE_ROOTS or $SS to enable)"
+            )
+        if not any(normalized == root or normalized.startswith(root + os.sep) for root in roots):
+            raise PathPolicyViolation(
+                "invalid path: absolute path is outside the allow-listed write roots "
+                "(set NUKE_MCP_WRITE_ROOTS to widen)"
+            )
+
+    return expanded
+
+
 def _handle_setup_write(params: dict) -> dict:
     """Create a Write node downstream of ``input_node`` with validated path/file_type.
 
-    Path traversal: any ``..`` component in ``path`` is rejected. Absolute
-    path policy is left to a future Phase D pass; for now we accept any
-    absolute or relative path that doesn't traverse upward.
+    Path policy (see ``_validate_write_path``):
+      * traversal (``..``) -> rejected.
+      * UNC (``\\\\server\\share\\...``) -> rejected.
+      * Windows reserved device basenames -> rejected.
+      * Absolute paths -> rejected unless they live under a root from
+        ``NUKE_MCP_WRITE_ROOTS`` (semicolon-separated) or, by default,
+        ``$HOME`` and ``$SS`` (Salt Spill sandbox).
+      * Relative paths -> accepted (resolved relative to the script's
+        cwd inside Nuke).
     """
     import nuke
 
     input_node = params["input_node"]
-    path = params["path"]
+    path = _validate_write_path(params["path"])
     file_type = params.get("file_type", "exr")
     colorspace = params.get("colorspace", "scene_linear")
 
-    if not isinstance(path, str) or ".." in path:
-        raise ValueError("invalid path: path traversal not permitted")
     if file_type not in _WRITE_FILE_TYPES:
         raise ValueError(f"invalid file_type: {file_type}")
 

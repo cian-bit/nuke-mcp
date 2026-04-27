@@ -51,15 +51,17 @@ def render_tools(mock_script):
 
 def test_setup_write_happy_path(render_tools):
     server, _script, tools = render_tools
-    result = tools["setup_write"]("plate", "/tmp/out/plate.####.exr")
-    assert result.get("status") != "error"
+    # Relative path: skips the absolute-path allow-list check entirely
+    # so the happy-path doesn't depend on $HOME / $SS contents.
+    result = tools["setup_write"]("plate", "out/plate.####.exr")
+    assert result.get("status") != "error", result
     assert server.executed_code == []
     assert len(server.typed_calls) == 1
     cmd, params = server.typed_calls[0]
     assert cmd == "setup_write"
     assert params == {
         "input_node": "plate",
-        "path": "/tmp/out/plate.####.exr",
+        "path": "out/plate.####.exr",
         "file_type": "exr",
         "colorspace": "scene_linear",
     }
@@ -75,17 +77,135 @@ def test_setup_write_path_traversal_rejected(render_tools):
 
 def test_setup_write_invalid_file_type_rejected(render_tools):
     _server, _script, tools = render_tools
-    result = tools["setup_write"]("plate", "/tmp/out.bad", file_type="badtype")
+    result = tools["setup_write"]("plate", "out.bad", file_type="badtype")
     assert result.get("status") == "error"
     assert "invalid" in result["error"].lower()
 
 
 def test_setup_write_alternate_format(render_tools):
     server, _script, tools = render_tools
-    tools["setup_write"]("plate", "/tmp/out.png", file_type="png", colorspace="sRGB")
+    tools["setup_write"]("plate", "out.png", file_type="png", colorspace="sRGB")
     _cmd, params = server.typed_calls[0]
     assert params["file_type"] == "png"
     assert params["colorspace"] == "sRGB"
+
+
+# ---------------------------------------------------------------------------
+# GPT-5.5 finding #7: setup_write absolute / UNC / device-name policy
+# ---------------------------------------------------------------------------
+
+
+def test_setup_write_blocks_windows_system_path(render_tools):
+    """Absolute path to C:\\Windows must be rejected (not in allow-list)."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", r"C:\Windows\System32\drivers\etc\hosts")
+    assert result.get("status") == "error"
+    assert "PathPolicyViolation" in result.get("error_class", "")
+
+
+def test_setup_write_blocks_unc_path(render_tools):
+    """UNC paths bypass the local allow-list entirely. Must be blocked."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", r"\\evil-server\share\evil.exr")
+    assert result.get("status") == "error"
+    assert "UNC" in result.get("error", "") or result.get("error_class") == "PathPolicyViolation"
+
+
+def test_setup_write_blocks_unc_forward_slash(render_tools):
+    """Forward-slash UNC form is also blocked."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "//evil-server/share/evil.exr")
+    assert result.get("status") == "error"
+
+
+def test_setup_write_blocks_etc_passwd(render_tools):
+    """Linux-style absolute paths outside the allow-list are blocked."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "/etc/passwd")
+    assert result.get("status") == "error"
+    assert "PathPolicyViolation" in result.get("error_class", "") or "absolute" in result.get(
+        "error", ""
+    )
+
+
+def test_setup_write_blocks_windows_reserved_device(render_tools):
+    """``CON``, ``PRN``, ``NUL`` etc. as the basename are rejected."""
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "out/CON.exr")
+    assert result.get("status") == "error"
+    assert "reserved" in result.get("error", "").lower() or "PathPolicyViolation" in result.get(
+        "error_class", ""
+    )
+
+
+def test_setup_write_blocks_nul_device(render_tools):
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "renders/NUL")
+    assert result.get("status") == "error"
+
+
+def test_setup_write_allows_path_under_home(render_tools, tmp_path, monkeypatch):
+    """Absolute path under $HOME passes (default allow-listed root)."""
+    import os
+
+    monkeypatch.setenv("HOME", str(tmp_path))  # POSIX
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+    monkeypatch.delenv("NUKE_MCP_WRITE_ROOTS", raising=False)
+    monkeypatch.delenv("SS", raising=False)
+    target = os.path.join(str(tmp_path), "renders", "out.####.exr")
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", target)
+    assert result.get("status") != "error", result
+
+
+def test_setup_write_allows_path_under_ss_when_set(render_tools, tmp_path, monkeypatch):
+    """``$SS`` sandbox is allow-listed by default when set."""
+    monkeypatch.setenv("SS", str(tmp_path))
+    monkeypatch.delenv("NUKE_MCP_WRITE_ROOTS", raising=False)
+    target = str(tmp_path / "renders" / "out.exr")
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", target)
+    assert result.get("status") != "error", result
+
+
+def test_setup_write_allows_path_under_explicit_override(render_tools, tmp_path, monkeypatch):
+    """``NUKE_MCP_WRITE_ROOTS`` overrides defaults entirely."""
+    monkeypatch.setenv("NUKE_MCP_WRITE_ROOTS", str(tmp_path))
+    monkeypatch.delenv("SS", raising=False)
+    target = str(tmp_path / "out.exr")
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", target)
+    assert result.get("status") != "error", result
+
+
+def test_setup_write_blocks_outside_explicit_roots(render_tools, tmp_path, monkeypatch):
+    """A path outside the explicit allow-list is rejected."""
+    import os
+
+    monkeypatch.setenv("NUKE_MCP_WRITE_ROOTS", str(tmp_path))
+    monkeypatch.delenv("SS", raising=False)
+    # Pick an absolute path that is NOT under tmp_path.
+    other_root = os.path.dirname(str(tmp_path))
+    other = os.path.join(other_root, "outside", "evil.exr")
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", other)
+    assert result.get("status") == "error"
+
+
+def test_setup_write_relative_path_still_allowed(render_tools, monkeypatch):
+    """Relative paths skip the absolute-allow-list check unconditionally."""
+    monkeypatch.delenv("NUKE_MCP_WRITE_ROOTS", raising=False)
+    monkeypatch.delenv("SS", raising=False)
+    _server, _script, tools = render_tools
+    result = tools["setup_write"]("plate", "renders/out.####.exr")
+    assert result.get("status") != "error", result
+
+
+def test_setup_write_rejects_non_string_path(render_tools):
+    _server, _script, tools = render_tools
+    # Pass an int -- the type-validate path takes the policy violation route.
+    result = tools["setup_write"]("plate", 12345)  # type: ignore[arg-type]
+    assert result.get("status") == "error"
 
 
 # ---------------------------------------------------------------------------

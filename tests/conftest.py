@@ -11,13 +11,26 @@ factories. Tests opt into the registry via the ``mock_script`` fixture.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import pathlib
 import socket
 import threading
 import time
 from typing import Any
 
 import pytest
+
+# Load nuke_plugin/addon.py directly (its package __init__ pulls a Nuke-only
+# import). Used by the mock server to mirror the addon's setup_write path
+# policy without inlining the validation rules in two places.
+_ADDON_PATH = pathlib.Path(__file__).resolve().parents[1] / "nuke_plugin" / "addon.py"
+_addon_spec = importlib.util.spec_from_file_location("_nuke_addon_for_tests", _ADDON_PATH)
+assert _addon_spec is not None and _addon_spec.loader is not None
+_addon_module = importlib.util.module_from_spec(_addon_spec)
+_addon_spec.loader.exec_module(_addon_module)
+_validate_write_path = _addon_module._validate_write_path
+PathPolicyViolation = _addon_module.PathPolicyViolation
 
 # ---------------------------------------------------------------------------
 # MockNukeNode + supporting knob types
@@ -1365,11 +1378,10 @@ class MockNukeServer:
     def _setup_write(self, p: dict) -> dict:
         self.typed_calls.append(("setup_write", dict(p)))
         input_node = p["input_node"]
-        path = p["path"]
+        # Mirror the addon-side path policy via shared validator.
+        path = _validate_write_path(p["path"])
         file_type = p.get("file_type", "exr")
         colorspace = p.get("colorspace", "scene_linear")
-        if not isinstance(path, str) or ".." in path:
-            raise ValueError("invalid path: path traversal not permitted")
         if file_type not in self._WRITE_TYPES:
             raise ValueError(f"invalid file_type: {file_type}")
         if input_node not in self.nodes:
