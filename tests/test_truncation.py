@@ -116,6 +116,48 @@ def test_matches_glob_wildcard_suffix():
 
 
 # ---------------------------------------------------------------------------
+# GPT-5.5 minor: pin the exact glob behaviour for note_font* /
+# postage_stamp_*. fnmatchcase("X*", "X") matches because ``*`` matches
+# zero or more chars; fnmatchcase("X_*", "X") does NOT match (the
+# ``_`` is required). These tests pin which knobs each glob covers so a
+# future maintainer doesn't accidentally widen / narrow the drop list.
+# ---------------------------------------------------------------------------
+
+
+def test_note_font_glob_matches_bare_note_font():
+    """``note_font*`` covers ``note_font`` itself (zero-char wildcard match)."""
+    assert _matches_glob("note_font", {"note_font*"})
+
+
+def test_note_font_glob_matches_extended_variants():
+    """All Nuke note_font_* knobs collapse onto the single glob."""
+    for name in ("note_font", "note_font_size", "note_font_color", "note_font_color_a"):
+        assert _matches_glob(name, {"note_font*"}), name
+
+
+def test_note_font_glob_does_not_match_unrelated_font_knobs():
+    """The glob is anchored to the ``note_font`` prefix."""
+    assert not _matches_glob("font_size", {"note_font*"})
+    assert not _matches_glob("font", {"note_font*"})
+    assert not _matches_glob("annotation_font", {"note_font*"})
+
+
+def test_postage_stamp_glob_does_not_match_bare_postage_stamp():
+    """``postage_stamp_*`` requires the trailing underscore -- bare
+    ``postage_stamp`` is the boolean toggle and is NOT dropped here.
+
+    (If ``postage_stamp`` itself ever needs dropping, add it as a
+    separate literal entry to ``_UI_KNOBS_EXTENDED``.)
+    """
+    assert not _matches_glob("postage_stamp", {"postage_stamp_*"})
+
+
+def test_postage_stamp_glob_matches_underscored_variants():
+    for name in ("postage_stamp_frame", "postage_stamp_size", "postage_stamp_color"):
+        assert _matches_glob(name, {"postage_stamp_*"}), name
+
+
+# ---------------------------------------------------------------------------
 # Drop allowlist
 # ---------------------------------------------------------------------------
 

@@ -123,13 +123,21 @@ def test_setup_color_correction_huecorrect(comp_tools):
     assert params["operation"] == "HueCorrect"
 
 
-def test_setup_color_correction_idempotent_re_run(comp_tools):
-    """Running the tool twice should ship two distinct typed calls."""
+def test_setup_color_correction_re_dispatch_creates_duplicate_nodes(comp_tools):
+    """Calling the tool twice ships two identical typed calls -- and the
+    addon (or mock) creates two distinct nodes (Grade1, Grade2). The old
+    name claimed idempotency, but Nuke names auto-uniquify, so the wire
+    re-dispatches but the end-state diverges. This is the
+    BENIGN_NEW-not-IDEMPOTENT contract pinned (GPT-5.5 finding #8).
+    """
     server, _script, tools = comp_tools
     tools["setup_color_correction"]("plate", operation="ColorCorrect")
     tools["setup_color_correction"]("plate", operation="ColorCorrect")
     assert len(server.typed_calls) == 2
     assert server.typed_calls[0] == server.typed_calls[1]
+    # Two distinct ColorCorrect nodes exist after the second call.
+    cc_nodes = [name for name, data in server.nodes.items() if data["type"] == "ColorCorrect"]
+    assert len(cc_nodes) == 2
 
 
 def test_setup_color_correction_rejects_injection(comp_tools):

@@ -6,15 +6,23 @@ The shape of a tool response goes through three passes:
   1. ``_estimate_response_size`` -- a fast recursive byte-count, no real
      ``json.dumps``. Cheaper than full serialization since the MCP layer
      will re-serialize anyway.
-  2. ``_truncate_response`` -- only fires when size > ``RESPONSE_SIZE_HARD``.
-     Strategies, in order:
-       a. Drop fields per the per-tool allowlist (knob-name globs included).
-       b. Truncate long string values to ``MAX_STR_LEN`` chars with a
-          ``"...<N chars>"`` suffix.
-       c. Truncate ``menu_items`` arrays to first ``MAX_MENU_ITEMS`` with
-          a ``"+N more"`` indicator.
-       d. Recursive deepest-children drop.
-       e. Digest fallback -- last resort, replace nested dicts with counts.
+  2. ``_truncate_response`` -- always-on passes (knob-glob drop, list
+     caps, list_nodes strip-to threshold) run for any operation that
+     configures them; size-gated passes (string truncation, menu_items
+     trim, summary fallback) only fire when the response crosses
+     ``RESPONSE_SIZE_WARN``. Strategies, in order:
+       a. Drop fields per the per-tool allowlist (knob-name globs).
+       b. Hard-cap a top-level list (keyframes / shapes / items / results).
+       c. Strip node entries to a tiny subset when ``len(nodes)`` exceeds
+          the per-tool ``threshold_count`` (list_nodes >= 200).
+       d. Truncate long string values to ``MAX_STR_LEN`` chars.
+       e. Truncate ``menu_items`` arrays to ``MAX_MENU_ITEMS`` with a
+          ``"+N more"`` sentinel.
+       f. Summary fallback: drop ``knobs`` (then ``inputs``) from every
+          node entry once still over the warn line.
+       g. Digest fallback -- last resort, replace nested containers with
+          ``{"_count": N, "_type": ...}`` so the response always fits
+          under any reasonable budget.
   3. ``_add_response_metadata`` -- always runs. Adds a ``_meta`` key with
      ``size_bytes`` (and, when truncated, ``truncated`` / ``digest_fallback``
      / ``drop_fields_applied``). Merges with any existing ``_meta`` so the
