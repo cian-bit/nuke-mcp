@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 
 from nuke_mcp import connection
 from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
+from nuke_mcp.prompts import register_prompts
 from nuke_mcp.tools import (
     channels,
     code,
@@ -139,6 +140,10 @@ def build_server(
 
     ctx = ServerContext(mcp=mcp, version=version, mock=mock)
     register_tools(ctx, active_profiles=active_profiles)
+    # Phase C10: workflow prompts surface as a separate MCP primitive
+    # (``prompts/list`` + ``prompts/get``), independent of the
+    # tool-profile gating above.
+    register_prompts(ctx)
 
     return mcp
 
