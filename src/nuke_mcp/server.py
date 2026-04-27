@@ -22,6 +22,7 @@ from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
 from nuke_mcp.tools import (
     channels,
     code,
+    color,
     comp,
     deep,
     digest,
@@ -88,6 +89,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     digest.register(ctx)
     tracking.register(ctx)
     deep.register(ctx)
+    color.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 
