@@ -79,6 +79,11 @@ PROFILES: dict[str, list[str]] = {
         # digest.py
         "scene_digest",
         "scene_delta",
+        # profiles.py (the runtime profile-loader itself lives in core
+        # so the model can always surface other profiles)
+        "list_profiles",
+        "load_profile",
+        "unload_profile",
     ],
     # Graph-advanced: bulk-mutation + escape-hatch + selection-driven
     # reads. Heavier-weight surfaces that a typical comp-read session

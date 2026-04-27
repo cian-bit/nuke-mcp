@@ -35,6 +35,9 @@ from nuke_mcp.tools import (
     tracking,
     viewer,
 )
+from nuke_mcp.tools import (
+    profiles as profiles_tools,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +87,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     digest.register(ctx)
     tracking.register(ctx)
     deep.register(ctx)
+    profiles_tools.register(ctx)
 
     # Diff: every tool listed in PROFILES that isn't part of an active
     # profile gets disabled. Tools missing from PROFILES entirely log a
