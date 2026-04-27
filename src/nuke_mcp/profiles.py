@@ -118,7 +118,7 @@ PROFILES: dict[str, list[str]] = {
         "setup_karma_aov_pipeline",
         "setup_aov_merge",
     ],
-    # 2D + 3D tracking primitives.
+    # 2D + 3D tracking primitives + C5 workflow macros.
     "tracking": [
         "setup_camera_tracker",
         "setup_planar_tracker",
@@ -126,6 +126,8 @@ PROFILES: dict[str, list[str]] = {
         "bake_tracker_to_corner_pin",
         "solve_3d_camera",
         "bake_camera_to_card",
+        # C5 workflow macros built on the C1 primitives above.
+        "setup_spaceship_track_patch",
     ],
     # Deep-comp primitives.
     "deep": [
@@ -156,7 +158,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "graph_advanced": ("Bulk graph operations and the execute_python escape hatch."),
     "color": "Keying and colour-correction setup tools.",
     "aov": "AOV merge / Karma EXR layer recombination.",
-    "tracking": "2D + 3D tracking and camera-solve primitives.",
+    "tracking": (
+        "2D + 3D tracking and camera-solve primitives, plus C5 workflow "
+        "macros (e.g. setup_spaceship_track_patch)."
+    ),
     "deep": "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.).",
     "distortion": (
         "Lens-distortion / STMap envelope + SmartVector propagate. "
