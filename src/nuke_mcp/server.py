@@ -20,6 +20,7 @@ from nuke_mcp.tools import (
     render,
     roto,
     script,
+    tracking,
     viewer,
 )
 
@@ -73,6 +74,7 @@ def build_server(mock: bool = False) -> FastMCP:
     expressions.register(ctx)
     roto.register(ctx)
     digest.register(ctx)
+    tracking.register(ctx)
 
     return mcp
 

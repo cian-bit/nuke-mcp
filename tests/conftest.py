@@ -721,6 +721,17 @@ class MockNukeNode:
         }
         return cls(name=name, node_class="EdgeBlur", knobs=knobs, xpos=xpos, ypos=ypos)
 
+    # C1: deep_to_image factory. The other deep + tracker factories
+    # already exist above (deeprecolor / deepmerge / deepholdout /
+    # deeptransform / cameratracker / planartracker / tracker4); we only
+    # add the one that wasn't there.
+    @classmethod
+    def deeptoimage(cls, name: str = "DeepToImage1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
+        knobs: dict[str, MockKnob] = {
+            "channels": MockChannelKnob("channels", value="rgba"),
+        }
+        return cls(name=name, node_class="DeepToImage", knobs=knobs, xpos=xpos, ypos=ypos)
+
 
 # ---------------------------------------------------------------------------
 # Registry: name -> MockNukeNode (mirrors nuke.toNode)
@@ -916,6 +927,19 @@ class MockNukeServer:
             # B7 scene digest
             "scene_digest": self._scene_digest,
             "scene_delta": self._scene_delta,
+            # C1 tracking primitives
+            "setup_camera_tracker": self._setup_camera_tracker,
+            "setup_planar_tracker": self._setup_planar_tracker,
+            "setup_tracker4": self._setup_tracker4,
+            "bake_tracker_to_corner_pin": self._bake_tracker_to_corner_pin,
+            "solve_3d_camera": self._solve_3d_camera,
+            "bake_camera_to_card": self._bake_camera_to_card,
+            # C1 deep primitives
+            "create_deep_recolor": self._create_deep_recolor,
+            "create_deep_merge": self._create_deep_merge,
+            "create_deep_holdout": self._create_deep_holdout,
+            "create_deep_transform": self._create_deep_transform,
+            "deep_to_image": self._deep_to_image,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -1443,6 +1467,322 @@ class MockNukeServer:
         body["hash"] = current_hash
         body["changed"] = True
         return body
+
+    # ------------------------------------------------------------------
+    # C1 tracking + deep typed handlers
+    #
+    # Each mirrors the addon-side allowlist + idempotency behaviour:
+    #   * appends ``(cmd, params)`` to ``self.typed_calls``
+    #   * if ``name`` is supplied AND a node of matching class+inputs
+    #     exists at that name, returns the existing NodeRef (idempotent).
+    #   * otherwise creates a fresh node, registers it in
+    #     ``self.nodes`` / ``self.connections``, and returns its NodeRef.
+    # ------------------------------------------------------------------
+
+    _CAMERA_SOLVE_METHODS = frozenset({"Match-Move", "Tripod", "Free Camera", "Planar", "Object"})
+    _DEEP_MERGE_OPS = frozenset({"over", "holdout"})
+
+    def _node_ref_from_state(self, name: str) -> dict[str, Any]:
+        data = self.nodes[name]
+        return {
+            "name": name,
+            "class": data["type"],
+            "xpos": int(data.get("x", 0)),
+            "ypos": int(data.get("y", 0)),
+            "inputs": list(self.connections.get(name, [])),
+        }
+
+    def _try_idempotent(
+        self,
+        name: str | None,
+        node_class: str,
+        expected_inputs: list[str | None],
+    ) -> dict[str, Any] | None:
+        """Return existing NodeRef if name+class+inputs matches; raise on mismatch."""
+        if not name or name not in self.nodes:
+            return None
+        existing = self.nodes[name]
+        if existing["type"] != node_class:
+            raise ValueError(
+                f"node '{name}' exists but is class '{existing['type']}', "
+                f"expected '{node_class}'"
+            )
+        actual_inputs = list(self.connections.get(name, []))
+        leading = actual_inputs[: len(expected_inputs)]
+        if leading != expected_inputs:
+            raise ValueError(
+                f"node '{name}' exists but has inputs {actual_inputs}, "
+                f"expected {expected_inputs}"
+            )
+        return self._node_ref_from_state(name)
+
+    def _register_node(
+        self,
+        node_class: str,
+        explicit_name: str | None,
+        default_base: str,
+        inputs: list[str | None],
+        knobs: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert a freshly-built node into ``self.nodes``. Returns its name."""
+        name = explicit_name or self._next_unique_name(default_base)
+        # If an explicit name collides with an unrelated node, the caller
+        # would have hit the idempotent path; this fallback uniquifies.
+        if name in self.nodes:
+            name = self._next_unique_name(default_base)
+        self.nodes[name] = {
+            "type": node_class,
+            "knobs": knobs or {},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[name] = list(inputs)
+        return name
+
+    def _setup_camera_tracker(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_camera_tracker", dict(p)))
+        input_node = p["input_node"]
+        features = int(p.get("features", 300))
+        solve_method = p.get("solve_method", "Match-Move")
+        mask = p.get("mask")
+        name = p.get("name")
+        if solve_method not in self._CAMERA_SOLVE_METHODS:
+            raise ValueError(f"invalid solve_method: {solve_method}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        if mask is not None and mask not in self.nodes:
+            raise ValueError(f"mask node not found: {mask}")
+        expected_inputs: list[str | None] = [input_node]
+        if mask is not None:
+            expected_inputs.append(mask)
+        cached = self._try_idempotent(name, "CameraTracker", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "CameraTracker",
+            name,
+            "CameraTracker1",
+            expected_inputs,
+            knobs={
+                "numberFeatures": features,
+                "solveMethod": solve_method,
+            },
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _setup_planar_tracker(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_planar_tracker", dict(p)))
+        input_node = p["input_node"]
+        plane_roto = p["plane_roto"]
+        ref_frame = int(p.get("ref_frame", 1))
+        name = p.get("name")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        if plane_roto not in self.nodes:
+            raise ValueError(f"plane_roto node not found: {plane_roto}")
+        expected_inputs = [input_node, plane_roto]
+        cached = self._try_idempotent(name, "PlanarTrackerNode", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "PlanarTrackerNode",
+            name,
+            "PlanarTracker1",
+            expected_inputs,
+            knobs={"referenceFrame": ref_frame},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _setup_tracker4(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_tracker4", dict(p)))
+        input_node = p["input_node"]
+        num_tracks = int(p.get("num_tracks", 4))
+        name = p.get("name")
+        if num_tracks < 1:
+            raise ValueError(f"num_tracks must be >= 1, got {num_tracks}")
+        if input_node not in self.nodes:
+            raise ValueError(f"node not found: {input_node}")
+        expected_inputs = [input_node]
+        cached = self._try_idempotent(name, "Tracker4", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "Tracker4",
+            name,
+            "Tracker1",
+            expected_inputs,
+            knobs={"num_tracks": num_tracks},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _bake_tracker_to_corner_pin(self, p: dict) -> dict:
+        self.typed_calls.append(("bake_tracker_to_corner_pin", dict(p)))
+        tracker_node = p["tracker_node"]
+        ref_frame = int(p.get("ref_frame", 1))
+        name = p.get("name")
+        if tracker_node not in self.nodes:
+            raise ValueError(f"tracker node not found: {tracker_node}")
+        expected_inputs = [tracker_node]
+        cached = self._try_idempotent(name, "CornerPin2D", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "CornerPin2D",
+            name,
+            "CornerPin1",
+            expected_inputs,
+            knobs={"reference_frame": ref_frame},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _solve_3d_camera(self, p: dict) -> dict:
+        self.typed_calls.append(("solve_3d_camera", dict(p)))
+        tracker_node = p["camera_tracker_node"]
+        name = p.get("name")
+        if tracker_node not in self.nodes:
+            raise ValueError(f"camera_tracker_node not found: {tracker_node}")
+        existing = self.nodes[tracker_node]
+        if existing["type"] != "CameraTracker":
+            raise ValueError(
+                f"node '{tracker_node}' is class '{existing['type']}', " f"expected CameraTracker"
+            )
+        # Idempotent: solving doesn't create a new node, it just marks
+        # the existing one solved. Optionally rename to ``name``.
+        existing.setdefault("knobs", {})["solved"] = True
+        if name and name != tracker_node:
+            self.nodes[name] = self.nodes.pop(tracker_node)
+            self.connections[name] = self.connections.pop(tracker_node, [])
+            tracker_node = name
+        return self._node_ref_from_state(tracker_node)
+
+    def _bake_camera_to_card(self, p: dict) -> dict:
+        self.typed_calls.append(("bake_camera_to_card", dict(p)))
+        camera_node = p["camera_node"]
+        frame = int(p.get("frame", 1))
+        name = p.get("name")
+        if camera_node not in self.nodes:
+            raise ValueError(f"camera_node not found: {camera_node}")
+        expected_inputs = [camera_node]
+        cached = self._try_idempotent(name, "Card3D", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "Card3D",
+            name,
+            "Card1",
+            expected_inputs,
+            knobs={"frame": frame},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _create_deep_recolor(self, p: dict) -> dict:
+        self.typed_calls.append(("create_deep_recolor", dict(p)))
+        deep_node = p["deep_node"]
+        color_node = p["color_node"]
+        target_input_alpha = bool(p.get("target_input_alpha", True))
+        name = p.get("name")
+        if deep_node not in self.nodes:
+            raise ValueError(f"deep node not found: {deep_node}")
+        if color_node not in self.nodes:
+            raise ValueError(f"color node not found: {color_node}")
+        expected_inputs = [deep_node, color_node]
+        cached = self._try_idempotent(name, "DeepRecolor", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "DeepRecolor",
+            name,
+            "DeepRecolor1",
+            expected_inputs,
+            knobs={"target_input_alpha": target_input_alpha},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _create_deep_merge(self, p: dict) -> dict:
+        self.typed_calls.append(("create_deep_merge", dict(p)))
+        a_node = p["a_node"]
+        b_node = p["b_node"]
+        op = p.get("op", "over")
+        name = p.get("name")
+        if op not in self._DEEP_MERGE_OPS:
+            raise ValueError(f"invalid op: {op}")
+        if a_node not in self.nodes:
+            raise ValueError(f"a_node not found: {a_node}")
+        if b_node not in self.nodes:
+            raise ValueError(f"b_node not found: {b_node}")
+        expected_inputs = [a_node, b_node]
+        cached = self._try_idempotent(name, "DeepMerge", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "DeepMerge",
+            name,
+            "DeepMerge1",
+            expected_inputs,
+            knobs={"operation": op},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _create_deep_holdout(self, p: dict) -> dict:
+        self.typed_calls.append(("create_deep_holdout", dict(p)))
+        subject_node = p["subject_node"]
+        holdout_node = p["holdout_node"]
+        name = p.get("name")
+        if subject_node not in self.nodes:
+            raise ValueError(f"subject_node not found: {subject_node}")
+        if holdout_node not in self.nodes:
+            raise ValueError(f"holdout_node not found: {holdout_node}")
+        expected_inputs = [subject_node, holdout_node]
+        cached = self._try_idempotent(name, "DeepHoldout", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "DeepHoldout",
+            name,
+            "DeepHoldout1",
+            expected_inputs,
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _create_deep_transform(self, p: dict) -> dict:
+        self.typed_calls.append(("create_deep_transform", dict(p)))
+        input_node = p["input_node"]
+        translate = p.get("translate", (0.0, 0.0, 0.0))
+        name = p.get("name")
+        if not isinstance(translate, list | tuple) or len(translate) != 3:
+            raise ValueError(f"translate must be a 3-tuple, got {translate!r}")
+        if input_node not in self.nodes:
+            raise ValueError(f"input_node not found: {input_node}")
+        expected_inputs = [input_node]
+        cached = self._try_idempotent(name, "DeepTransform", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "DeepTransform",
+            name,
+            "DeepTransform1",
+            expected_inputs,
+            knobs={"translate": list(translate)},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _deep_to_image(self, p: dict) -> dict:
+        self.typed_calls.append(("deep_to_image", dict(p)))
+        input_node = p["input_node"]
+        name = p.get("name")
+        if input_node not in self.nodes:
+            raise ValueError(f"input_node not found: {input_node}")
+        expected_inputs = [input_node]
+        cached = self._try_idempotent(name, "DeepToImage", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "DeepToImage",
+            name,
+            "DeepToImage1",
+            expected_inputs,
+        )
+        return self._node_ref_from_state(new_name)
 
 
 @pytest.fixture(autouse=True)

@@ -97,6 +97,13 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     # digest.py (B7)
     "scene_digest": READ_ONLY,
     "scene_delta": READ_ONLY,
+    # tracking.py (C1)
+    "setup_camera_tracker": BENIGN_NEW,
+    "setup_planar_tracker": BENIGN_NEW,
+    "setup_tracker4": BENIGN_NEW,
+    "bake_tracker_to_corner_pin": BENIGN_NEW,
+    "solve_3d_camera": BENIGN_NEW,
+    "bake_camera_to_card": BENIGN_NEW,
 }
 
 
