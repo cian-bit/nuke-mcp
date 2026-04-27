@@ -19,6 +19,7 @@ from nuke_mcp import connection
 from nuke_mcp.annotations import IDEMPOTENT, READ_ONLY
 from nuke_mcp.models import KnobValue
 from nuke_mcp.models._warnings import warn_once
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -60,10 +61,7 @@ def _coerce_knob_value(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("get_knob")
     def get_knob(node: str, knob: str) -> dict:
         """Read a knob value from a node.
@@ -77,7 +75,7 @@ def register(ctx: ServerContext) -> None:
             _coerce_knob_value(result)
         return result
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=IDEMPOTENT)
     @nuke_command("set_knob")
     def set_knob(node: str, knob: str, value: str | int | float | bool) -> dict:
         """Set a knob value on a node.

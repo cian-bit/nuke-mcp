@@ -22,6 +22,7 @@ from nuke_mcp import connection
 from nuke_mcp.annotations import READ_ONLY
 from nuke_mcp.models import DiffResult, NodeInfo
 from nuke_mcp.models._warnings import warn_once
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -41,10 +42,7 @@ def _model_dump(model: Any) -> dict[str, Any]:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("read_comp")
     def read_comp(
         root: str | None = None,
@@ -105,10 +103,7 @@ def register(ctx: ServerContext) -> None:
             result["nodes"] = typed_nodes
         return result
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY, output_model=NodeInfo)
     @nuke_command("read_node_detail")
     def read_node_detail(name: str) -> dict:
         """Deep inspection of a single node. Returns all non-default knobs,
@@ -132,10 +127,7 @@ def register(ctx: ServerContext) -> None:
                 return result
         return result
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("read_selected")
     def read_selected() -> dict:
         """Read only the currently selected nodes and their connections.
@@ -143,10 +135,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("read_selected")
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("snapshot_comp")
     def snapshot_comp() -> dict:
         """Take a snapshot of the current comp state. Returns a snapshot_id
@@ -156,10 +145,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("snapshot_comp")
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY, output_model=DiffResult)
     @nuke_command("diff_comp")
     def diff_comp(snapshot_id: str) -> dict:
         """Compare the current comp to a previous snapshot. Shows nodes

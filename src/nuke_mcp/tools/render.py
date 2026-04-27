@@ -16,6 +16,7 @@ from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
 from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.models import RenderResult
 from nuke_mcp.models._warnings import warn_once
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -61,9 +62,11 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(
+    @nuke_tool(
+        ctx,
+        profile="core",
         annotations=DESTRUCTIVE | OPEN_WORLD,
-        output_schema=None,
+        output_model=RenderResult,
     )
     @nuke_command("render_frames")
     def render_frames(
