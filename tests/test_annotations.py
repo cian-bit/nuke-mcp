@@ -121,6 +121,14 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "tasks_get": READ_ONLY,
     "tasks_cancel": DESTRUCTIVE,
     "tasks_resume": READ_ONLY,
+    # ml.py (C7 -- CopyCat training + Cattery model registry).
+    # Training and install dispatch as Tasks; serve_copycat is a
+    # graph mutation; list_cattery_models is a read.
+    "train_copycat": BENIGN_NEW,
+    "serve_copycat": BENIGN_NEW,
+    "setup_dehaze_copycat": BENIGN_NEW,
+    "list_cattery_models": READ_ONLY,
+    "install_cattery_model": BENIGN_NEW,
 }
 
 
