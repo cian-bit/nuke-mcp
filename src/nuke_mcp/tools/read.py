@@ -3,6 +3,14 @@
 This is the core differentiator: Claude can natively read a comp
 without screenshots. read_comp serializes the node graph into
 structured data with only non-default knob values to save tokens.
+
+B5 plumbs the addon dict through ``NodeInfo`` / ``DiffResult`` at the
+tool boundary: the model parses the wire payload, then we re-emit
+via ``model_dump(by_alias=True, exclude_none=True, exclude_unset=True)``.
+``extra="allow"`` + ``exclude_unset`` together mean any field the
+addon didn't send doesn't materialise in the response, so the wire
+shape stays byte-stable for existing test fixtures while typed
+attribute access becomes available downstream.
 """
 
 from __future__ import annotations
@@ -11,10 +19,21 @@ from typing import Any
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import READ_ONLY
+from nuke_mcp.models import DiffResult, NodeInfo
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
     from nuke_mcp.server import ServerContext
+
+
+def _model_dump(model: Any) -> dict[str, Any]:
+    """``model_dump`` with the canonical B5 flag set.
+
+    ``by_alias=True`` preserves wire keys; ``exclude_none`` drops null
+    placeholders; ``exclude_unset`` keeps the dump byte-stable when
+    the addon omitted a field.
+    """
+    return model.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
 
 
 def register(ctx: ServerContext) -> None:
@@ -56,7 +75,25 @@ def register(ctx: ServerContext) -> None:
             params["offset"] = offset
         if limit:
             params["limit"] = limit
-        return connection.send("read_comp", **params)
+        result = connection.send("read_comp", **params)
+        # Per-node validation through NodeInfo. We mutate ``result`` in
+        # place so the envelope (count / total / offset / limit / extras)
+        # passes through untouched -- only the ``nodes`` list goes through
+        # the model.
+        if isinstance(result, dict) and isinstance(result.get("nodes"), list):
+            typed_nodes: list[dict[str, Any]] = []
+            for entry in result["nodes"]:
+                if isinstance(entry, dict):
+                    try:
+                        typed_nodes.append(_model_dump(NodeInfo.model_validate(entry)))
+                    except Exception:
+                        # Defensive: never fail closed on a model error -- a
+                        # malformed node entry shouldn't sink the whole call.
+                        typed_nodes.append(entry)
+                else:
+                    typed_nodes.append(entry)
+            result["nodes"] = typed_nodes
+        return result
 
     @ctx.mcp.tool(
         annotations=READ_ONLY,
@@ -71,7 +108,13 @@ def register(ctx: ServerContext) -> None:
         Args:
             name: node name to inspect.
         """
-        return connection.send("get_node_info", name=name)
+        result = connection.send("get_node_info", name=name)
+        if isinstance(result, dict):
+            try:
+                return _model_dump(NodeInfo.model_validate(result))
+            except Exception:
+                return result
+        return result
 
     @ctx.mcp.tool(
         annotations=READ_ONLY,
@@ -109,4 +152,10 @@ def register(ctx: ServerContext) -> None:
         Args:
             snapshot_id: ID from a previous snapshot_comp call.
         """
-        return connection.send("diff_comp", snapshot_id=snapshot_id)
+        result = connection.send("diff_comp", snapshot_id=snapshot_id)
+        if isinstance(result, dict) and "added" in result and "removed" in result:
+            try:
+                return _model_dump(DiffResult.model_validate(result))
+            except Exception:
+                return result
+        return result

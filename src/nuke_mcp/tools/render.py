@@ -1,14 +1,28 @@
-"""Render and precomp tools."""
+"""Render and precomp tools.
+
+B5 wraps the addon's ``render`` reply through ``RenderResult`` -- the
+wire shape ``{rendered, frames}`` flows through the model, which adds
+typed accessors for ``frames_written`` / ``output_path`` while
+preserving the original keys via ``extra="allow"``.
+"""
 
 from __future__ import annotations
+
+from typing import Any
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
 from nuke_mcp.main_thread import run_on_main
+from nuke_mcp.models import RenderResult
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
     from nuke_mcp.server import ServerContext
+
+
+def _model_dump(model: Any) -> dict[str, Any]:
+    """``model_dump`` with the canonical B5 flag set."""
+    return model.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
 
 
 def register(ctx: ServerContext) -> None:
@@ -78,7 +92,13 @@ def register(ctx: ServerContext) -> None:
         # render = non-idempotent (writes frames). 900s class timeout
         # via TIMEOUT_CLASSES["render"] -- removes the prior 300s magic
         # number and routes the call through the same envelope as send().
-        return connection.send("render", _class="render", **params)
+        result = connection.send("render", _class="render", **params)
+        if isinstance(result, dict) and "rendered" in result:
+            try:
+                return _model_dump(RenderResult.model_validate(result))
+            except Exception:
+                return result
+        return result
 
     # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
     # ``destructiveHint=False`` so the schema explicitly marks it benign.
