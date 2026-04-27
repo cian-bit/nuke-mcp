@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import IDEMPOTENT, READ_ONLY
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools import _safety
 from nuke_mcp.tools._helpers import nuke_command
 
@@ -12,7 +13,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=IDEMPOTENT)
     @nuke_command("set_expression")
     def set_expression(node: str, knob: str, expression: str) -> dict:
         """Set a TCL expression on a knob. The expression is evaluated per-frame.
@@ -37,7 +38,7 @@ def register(ctx: ServerContext) -> None:
             }
         return connection.send("set_expression", node=node, knob=knob, expression=expression)
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=IDEMPOTENT)
     @nuke_command("clear_expression")
     def clear_expression(node: str, knob: str) -> dict:
         """Remove an expression or animation from a knob, leaving it at its current value.
@@ -48,7 +49,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("clear_expression", node=node, knob=knob)
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=IDEMPOTENT)
     @nuke_command("set_keyframe")
     def set_keyframe(node: str, knob: str, frame: int, value: float) -> dict:
         """Set a keyframe on a knob at a specific frame. Creates animation if
@@ -62,10 +63,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("set_keyframe", node=node, knob=knob, frame=frame, value=value)
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("list_keyframes")
     def list_keyframes(node: str, knob: str) -> dict:
         """List all keyframes on a knob. Returns frame/value pairs.

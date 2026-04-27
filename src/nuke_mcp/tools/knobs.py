@@ -90,7 +90,7 @@ def register(ctx: ServerContext) -> None:
             _coerce_knob_value(result)
         return result
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="graph_advanced", annotations=IDEMPOTENT)
     @nuke_command("set_knobs")
     def set_knobs(operations: str) -> dict:
         """Set multiple knobs across multiple nodes in one call. Saves round-trips.

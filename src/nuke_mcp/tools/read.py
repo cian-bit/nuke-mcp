@@ -127,7 +127,7 @@ def register(ctx: ServerContext) -> None:
                 return result
         return result
 
-    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
+    @nuke_tool(ctx, profile="graph_advanced", annotations=READ_ONLY)
     @nuke_command("read_selected")
     def read_selected() -> dict:
         """Read only the currently selected nodes and their connections.

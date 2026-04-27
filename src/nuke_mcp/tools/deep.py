@@ -18,6 +18,7 @@ from typing import Literal
 
 from nuke_mcp.annotations import BENIGN_NEW
 from nuke_mcp.main_thread import run_on_main
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -25,7 +26,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="deep", annotations=BENIGN_NEW)
     @nuke_command("create_deep_recolor")
     def create_deep_recolor(
         deep_node: str,
@@ -52,7 +53,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("create_deep_recolor", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="deep", annotations=BENIGN_NEW)
     @nuke_command("create_deep_merge")
     def create_deep_merge(
         a_node: str,
@@ -78,7 +79,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("create_deep_merge", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="deep", annotations=BENIGN_NEW)
     @nuke_command("create_deep_holdout")
     def create_deep_holdout(
         subject_node: str,
@@ -101,7 +102,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("create_deep_holdout", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="deep", annotations=BENIGN_NEW)
     @nuke_command("create_deep_transform")
     def create_deep_transform(
         input_node: str,
@@ -123,7 +124,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("create_deep_transform", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="deep", annotations=BENIGN_NEW)
     @nuke_command("deep_to_image")
     def deep_to_image(
         input_node: str,
