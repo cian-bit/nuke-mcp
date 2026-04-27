@@ -118,13 +118,14 @@ PROFILES: dict[str, list[str]] = {
         "solve_3d_camera",
         "bake_camera_to_card",
     ],
-    # Deep-comp primitives.
+    # Deep-comp primitives + workflow macros (C6).
     "deep": [
         "create_deep_recolor",
         "create_deep_merge",
         "create_deep_holdout",
         "create_deep_transform",
         "deep_to_image",
+        "setup_flip_blood_comp",
     ],
 }
 
@@ -141,7 +142,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "color": "Keying and colour-correction setup tools.",
     "aov": "AOV merge / Karma EXR layer recombination.",
     "tracking": "2D + 3D tracking and camera-solve primitives.",
-    "deep": "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.).",
+    "deep": (
+        "Deep-comp primitives (DeepRecolor, DeepMerge, DeepHoldout etc.) "
+        "plus workflow macros (setup_flip_blood_comp)."
+    ),
 }
 
 

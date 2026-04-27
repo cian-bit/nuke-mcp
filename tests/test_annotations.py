@@ -110,6 +110,8 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "create_deep_holdout": BENIGN_NEW,
     "create_deep_transform": BENIGN_NEW,
     "deep_to_image": BENIGN_NEW,
+    # deep_workflow.py (C6)
+    "setup_flip_blood_comp": BENIGN_NEW,
     # profiles.py (B4) -- runtime profile loading. ``list_profiles``
     # is a pure read; load/unload mutate the visible tool surface but
     # nothing in the Nuke session, hence ``BENIGN_NEW``-shape stamps.

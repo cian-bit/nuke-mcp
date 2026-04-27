@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import socket
 import threading
@@ -947,6 +948,8 @@ class MockNukeServer:
             "create_deep_holdout": self._create_deep_holdout,
             "create_deep_transform": self._create_deep_transform,
             "deep_to_image": self._deep_to_image,
+            # C6 deep workflow macro
+            "setup_flip_blood_comp": self._setup_flip_blood_comp,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -1813,6 +1816,251 @@ class MockNukeServer:
             expected_inputs,
         )
         return self._node_ref_from_state(new_name)
+
+    # ------------------------------------------------------------------
+    # C6 deep workflow macro
+    #
+    # Mirrors the addon-side composition: builds a Group, calls each
+    # sub-handler so ``self.typed_calls`` records the same wire shape
+    # production would, and stores Grade/VectorBlur/ZDefocus knobs on
+    # the mock node entries so tests can assert against them directly.
+    # ------------------------------------------------------------------
+
+    def _shot_id(self) -> str:
+        shot = os.environ.get("SS_SHOT")
+        if shot:
+            return shot
+        # Fall back to the script_info script-path stem (mirrors
+        # ``nuke.root().name()`` in production).
+        path = self.script_info.get("script", "") or ""
+        if path:
+            stem = pathlib.Path(path).stem
+            if stem:
+                return stem
+        return "unknown"
+
+    def _setup_flip_blood_comp(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_flip_blood_comp", dict(p)))
+        beauty = p["beauty"]
+        deep_pass = p["deep_pass"]
+        motion = p.get("motion")
+        holdout_roto = p.get("holdout_roto")
+        blood_tint = p.get("blood_tint", [0.35, 0.02, 0.04])
+        explicit_name = p.get("name")
+
+        if (
+            not isinstance(blood_tint, list | tuple)
+            or len(blood_tint) != 3
+            or not all(isinstance(v, int | float) for v in blood_tint)
+        ):
+            raise ValueError(f"blood_tint must be a 3-tuple of numbers, got {blood_tint!r}")
+
+        if beauty not in self.nodes:
+            raise ValueError(f"beauty node not found: {beauty}")
+        if deep_pass not in self.nodes:
+            raise ValueError(f"deep_pass node not found: {deep_pass}")
+        if motion is not None and motion not in self.nodes:
+            raise ValueError(f"motion node not found: {motion}")
+        if holdout_roto is not None and holdout_roto not in self.nodes:
+            raise ValueError(f"holdout_roto node not found: {holdout_roto}")
+
+        group_name = explicit_name or f"FLIP_Blood_{self._shot_id()}"
+
+        # Idempotent re-call: existing Group of that name -> rebuild
+        # the payload from suffix lookups without re-creating any
+        # children.
+        if group_name in self.nodes:
+            existing = self.nodes[group_name]
+            if existing["type"] != "Group":
+                raise ValueError(
+                    f"node '{group_name}' exists but is class "
+                    f"'{existing['type']}', expected 'Group'"
+                )
+            vblur_name = f"{group_name}_vblur"
+            return {
+                "group": group_name,
+                "recolor": f"{group_name}_recolor",
+                "holdout": f"{group_name}_holdout",
+                "merge": f"{group_name}_merge",
+                "flatten": f"{group_name}_flatten",
+                "grade": f"{group_name}_grade",
+                "vector_blur": vblur_name if vblur_name in self.nodes else None,
+                "zdefocus": f"{group_name}_zdefocus",
+            }
+
+        self.nodes[group_name] = {
+            "type": "Group",
+            "knobs": {},
+            "x": 0,
+            "y": 0,
+        }
+        # Group inputs: 0=deep, 1=beauty, then optional holdout/motion.
+        group_inputs: list[str] = [deep_pass, beauty]
+        if holdout_roto is not None:
+            group_inputs.append(holdout_roto)
+        if motion is not None:
+            group_inputs.append(motion)
+        self.connections[group_name] = group_inputs
+
+        # Internal Inputs -- these stand in for Nuke's ``Input`` nodes
+        # the addon creates inside the Group. Tests can check that
+        # children carry the group as a parent via their ``group`` knob.
+        in_deep = self._register_node(
+            "Input",
+            f"{group_name}_in_deep",
+            f"{group_name}_in_deep",
+            [],
+            knobs={"group": group_name},
+        )
+        in_beauty = self._register_node(
+            "Input",
+            f"{group_name}_in_beauty",
+            f"{group_name}_in_beauty",
+            [],
+            knobs={"group": group_name},
+        )
+
+        # DeepRecolor via the C1 handler -- records ('create_deep_recolor', ...)
+        # in typed_calls.
+        recolor_ref = self._create_deep_recolor(
+            {
+                "deep_node": in_deep,
+                "color_node": in_beauty,
+                "target_input_alpha": True,
+                "name": f"{group_name}_recolor",
+            }
+        )
+        self.nodes[recolor_ref["name"]].setdefault("knobs", {})["group"] = group_name
+
+        if holdout_roto is not None:
+            in_holdout = self._register_node(
+                "Input",
+                f"{group_name}_in_holdout",
+                f"{group_name}_in_holdout",
+                [],
+                knobs={"group": group_name},
+            )
+            holdout_against = in_holdout
+        else:
+            holdout_against = recolor_ref["name"]
+        holdout_ref = self._create_deep_holdout(
+            {
+                "subject_node": recolor_ref["name"],
+                "holdout_node": holdout_against,
+                "name": f"{group_name}_holdout",
+            }
+        )
+        self.nodes[holdout_ref["name"]].setdefault("knobs", {})["group"] = group_name
+
+        merge_ref = self._create_deep_merge(
+            {
+                "a_node": holdout_ref["name"],
+                "b_node": in_deep,
+                "op": "over",
+                "name": f"{group_name}_merge",
+            }
+        )
+        self.nodes[merge_ref["name"]].setdefault("knobs", {})["group"] = group_name
+
+        flatten_ref = self._deep_to_image(
+            {
+                "input_node": merge_ref["name"],
+                "name": f"{group_name}_flatten",
+            }
+        )
+        self.nodes[flatten_ref["name"]].setdefault("knobs", {})["group"] = group_name
+
+        ocio_in = self._register_node(
+            "OCIOColorSpace",
+            f"{group_name}_to_acescct",
+            f"{group_name}_to_acescct",
+            [flatten_ref["name"]],
+            knobs={
+                "group": group_name,
+                "in_colorspace": "scene_linear",
+                "out_colorspace": "ACES - ACEScct",
+            },
+        )
+
+        grade_name = f"{group_name}_grade"
+        self._register_node(
+            "Grade",
+            grade_name,
+            grade_name,
+            [ocio_in],
+            knobs={
+                "group": group_name,
+                "multiply": list(blood_tint),
+            },
+        )
+
+        ocio_out = self._register_node(
+            "OCIOColorSpace",
+            f"{group_name}_from_acescct",
+            f"{group_name}_from_acescct",
+            [grade_name],
+            knobs={
+                "group": group_name,
+                "in_colorspace": "ACES - ACEScct",
+                "out_colorspace": "scene_linear",
+            },
+        )
+
+        last = ocio_out
+        vblur_name: str | None = None
+        if motion is not None:
+            in_motion = self._register_node(
+                "Input",
+                f"{group_name}_in_motion",
+                f"{group_name}_in_motion",
+                [],
+                knobs={"group": group_name},
+            )
+            vblur_name = f"{group_name}_vblur"
+            self._register_node(
+                "VectorBlur",
+                vblur_name,
+                vblur_name,
+                [last, in_motion],
+                knobs={"group": group_name},
+            )
+            last = vblur_name
+
+        zdf_name = f"{group_name}_zdefocus"
+        self._register_node(
+            "ZDefocus2",
+            zdf_name,
+            zdf_name,
+            [last],
+            knobs={
+                "group": group_name,
+                # Foundry rule: hardcoded constraints.
+                "math": "depth",
+                "depth_channel": "deep.front",
+                "aa": False,
+                "depth_aa": False,
+            },
+        )
+
+        # Final Output node inside the group.
+        self._register_node(
+            "Output",
+            f"{group_name}_out_main",
+            f"{group_name}_out_main",
+            [zdf_name],
+            knobs={"group": group_name},
+        )
+
+        return {
+            "group": group_name,
+            "recolor": recolor_ref["name"],
+            "holdout": holdout_ref["name"],
+            "merge": merge_ref["name"],
+            "flatten": flatten_ref["name"],
+            "grade": grade_name,
+            "vector_blur": vblur_name,
+            "zdefocus": zdf_name,
+        }
 
 
 @pytest.fixture(autouse=True)

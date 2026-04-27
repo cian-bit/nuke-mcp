@@ -2251,6 +2251,295 @@ def _handle_deep_to_image(params: dict) -> dict:
     return _node_ref(n)
 
 
+# ---------------------------------------------------------------------------
+# C6: deep-workflow macro
+#
+# ``setup_flip_blood_comp`` orchestrates the C1 deep primitives into a
+# FLIP-blood deep-comp pipeline wrapped in a Group. The macro composes
+# -- it does not reimplement -- so the underlying ``_handle_create_*``
+# handlers stay the single source of truth for class lookup, idempotency,
+# and class-fix fallbacks (DeepHoldout2 vs legacy DeepHoldout).
+#
+# ZDefocus knob trio is hardcoded by Foundry rule:
+#   * math = depth
+#   * depth = deep.front
+#   * AA-on-depth disabled (no spatial AA on the depth channel)
+# Anti-aliasing the depth channel produces false intermediate Z values
+# that bleed across silhouettes, so this is a constraint, not a knob.
+# ---------------------------------------------------------------------------
+
+
+def _shot_id_from_env_or_script() -> str:
+    """Return ``$SS_SHOT`` or the current script stem; ``unknown`` if neither.
+
+    Matches the convention used by the other ``setup_*`` macros in the
+    codebase: env-var first (production-pipeline override), then the
+    on-disk script name's stem (Nuke's ``root.name``), then a literal
+    fallback so the Group always gets a non-empty suffix.
+    """
+    import nuke
+
+    shot = os.environ.get("SS_SHOT")
+    if shot:
+        return shot
+    try:
+        script_path = nuke.root().name()
+    except Exception:
+        script_path = ""
+    if script_path:
+        stem = pathlib.Path(script_path).stem
+        if stem:
+            return stem
+    return "unknown"
+
+
+def _handle_setup_flip_blood_comp(params: dict) -> dict:
+    """Compose the FLIP-blood deep-comp pipeline and wrap it in a Group.
+
+    Pipeline (top -> bottom):
+        DeepRead(``deep_pass``) -> DeepRecolor(``beauty``) ->
+        DeepHoldout(``holdout_roto``) -> DeepMerge over BG ->
+        DeepToImage -> Grade(``blood_tint``) ->
+        [VectorBlur(``motion``)] -> ZDefocus.
+
+    Each sub-step calls into the existing C1 handler so the class-fix
+    fallbacks (DeepHoldout2 vs DeepHoldout) and idempotency keys stay
+    centralised.
+    """
+    import nuke
+
+    beauty = params["beauty"]
+    deep_pass = params["deep_pass"]
+    motion = params.get("motion")
+    holdout_roto = params.get("holdout_roto")
+    blood_tint = params.get("blood_tint", [0.35, 0.02, 0.04])
+    explicit_name = params.get("name")
+
+    if (
+        not isinstance(blood_tint, list | tuple)
+        or len(blood_tint) != 3
+        or not all(isinstance(v, int | float) for v in blood_tint)
+    ):
+        raise ValueError(f"blood_tint must be a 3-tuple of numbers, got {blood_tint!r}")
+
+    beauty_node = _resolve_node(beauty)
+    if beauty_node is None:
+        raise ValueError(f"beauty node not found: {beauty}")
+    deep_node = _resolve_node(deep_pass)
+    if deep_node is None:
+        raise ValueError(f"deep_pass node not found: {deep_pass}")
+    motion_node = None
+    if motion is not None:
+        motion_node = _resolve_node(motion)
+        if motion_node is None:
+            raise ValueError(f"motion node not found: {motion}")
+    holdout_node = None
+    if holdout_roto is not None:
+        holdout_node = _resolve_node(holdout_roto)
+        if holdout_node is None:
+            raise ValueError(f"holdout_roto node not found: {holdout_roto}")
+
+    group_name = explicit_name or f"FLIP_Blood_{_shot_id_from_env_or_script()}"
+
+    # Idempotent re-call: an existing Group of the same name short-circuits
+    # the entire macro. The sub-handlers honour ``name=`` themselves on a
+    # per-node basis, but the user-facing contract is "same group name ->
+    # same group", so we trust the Group's existence as the cache key.
+    existing_group = nuke.toNode(group_name)
+    if existing_group is not None:
+        if existing_group.Class() != "Group":
+            raise ValueError(
+                f"node '{group_name}' exists but is class "
+                f"'{existing_group.Class()}', expected 'Group'"
+            )
+        return _flip_blood_payload_from_group(existing_group)
+
+    group = nuke.nodes.Group()
+    group.setName(group_name)
+    group.setXYpos(beauty_node.xpos(), beauty_node.ypos() + 100)
+
+    # Children are created inside the Group via the ``with`` context --
+    # ``nuke.nodes.Foo()`` honours the active group when one is pushed.
+    # The C1 sub-handlers also use ``nuke.nodes.X`` so they land in the
+    # group automatically when we call them inside this block.
+    member_names: dict[str, str | None] = {
+        "vector_blur": None,
+    }
+    with group:
+        # The deep / beauty inputs themselves live OUTSIDE the group;
+        # we reach them via Input nodes wired to the group's own input
+        # slots. Slot 0 = deep_pass, slot 1 = beauty,
+        # slot 2 = holdout_roto (when supplied), slot 3 = motion.
+        in_deep = nuke.nodes.Input(name="in_deep")
+        in_deep.setXYpos(0, 0)
+        in_beauty = nuke.nodes.Input(name="in_beauty")
+        in_beauty.setXYpos(120, 0)
+
+        # DeepRecolor: deep on slot 0, beauty on slot 1.
+        recolor = _handle_create_deep_recolor(
+            {
+                "deep_node": "in_deep",
+                "color_node": "in_beauty",
+                "target_input_alpha": True,
+                "name": f"{group_name}_recolor",
+            }
+        )
+
+        in_holdout = None
+        if holdout_node is not None:
+            in_holdout = nuke.nodes.Input(name="in_holdout")
+            in_holdout.setXYpos(240, 0)
+
+        # DeepHoldout: subject = recolor, holdout = in_holdout when
+        # supplied else the recolor itself (no-op holdout). The C1
+        # handler picks DeepHoldout2 vs DeepHoldout based on the live
+        # Nuke build.
+        holdout_subject = recolor["name"]
+        holdout_against = "in_holdout" if in_holdout is not None else recolor["name"]
+        holdout = _handle_create_deep_holdout(
+            {
+                "subject_node": holdout_subject,
+                "holdout_node": holdout_against,
+                "name": f"{group_name}_holdout",
+            }
+        )
+
+        # DeepMerge over: subject (post-holdout) vs the deep_pass itself
+        # standing in for the BG plate. The merge composes the recoloured
+        # FLIP onto its own depth context.
+        merge = _handle_create_deep_merge(
+            {
+                "a_node": holdout["name"],
+                "b_node": "in_deep",
+                "op": "over",
+                "name": f"{group_name}_merge",
+            }
+        )
+
+        # Flatten to 2D.
+        flatten = _handle_deep_to_image(
+            {
+                "input_node": merge["name"],
+                "name": f"{group_name}_flatten",
+            }
+        )
+
+        # Grade with blood_tint multiply, sandwiched in an ACEScct
+        # OCIOColorSpace pair so the multiply runs in the working
+        # colour space rather than scene-linear (which would crush
+        # saturation on the 0.02/0.04 channels).
+        ocio_in = nuke.nodes.OCIOColorSpace(name=f"{group_name}_to_acescct")
+        ocio_in.setInput(0, nuke.toNode(flatten["name"]))
+        if ocio_in.knob("in_colorspace"):
+            with contextlib.suppress(Exception):
+                ocio_in["in_colorspace"].setValue("scene_linear")
+        if ocio_in.knob("out_colorspace"):
+            with contextlib.suppress(Exception):
+                ocio_in["out_colorspace"].setValue("ACES - ACEScct")
+
+        grade = nuke.nodes.Grade(name=f"{group_name}_grade")
+        grade.setInput(0, ocio_in)
+        if grade.knob("multiply"):
+            for i, v in enumerate(blood_tint):
+                with contextlib.suppress(Exception):
+                    grade["multiply"].setValue(float(v), i)
+
+        ocio_out = nuke.nodes.OCIOColorSpace(name=f"{group_name}_from_acescct")
+        ocio_out.setInput(0, grade)
+        if ocio_out.knob("in_colorspace"):
+            with contextlib.suppress(Exception):
+                ocio_out["in_colorspace"].setValue("ACES - ACEScct")
+        if ocio_out.knob("out_colorspace"):
+            with contextlib.suppress(Exception):
+                ocio_out["out_colorspace"].setValue("scene_linear")
+
+        last = ocio_out
+        vblur = None
+        if motion_node is not None:
+            in_motion = nuke.nodes.Input(name="in_motion")
+            in_motion.setXYpos(360, 0)
+            vblur = nuke.nodes.VectorBlur(name=f"{group_name}_vblur")
+            vblur.setInput(0, last)
+            # Slot 1 of VectorBlur is the motion-vector source.
+            vblur.setInput(1, in_motion)
+            last = vblur
+
+        # ZDefocus: math=depth, depth=deep.front, AA-on-depth off.
+        zdf = nuke.nodes.ZDefocus2(name=f"{group_name}_zdefocus")
+        zdf.setInput(0, last)
+        # Foundry rule: hardcoded constraints.
+        if zdf.knob("math"):
+            with contextlib.suppress(Exception):
+                zdf["math"].setValue("depth")
+        if zdf.knob("depth_channel"):
+            with contextlib.suppress(Exception):
+                zdf["depth_channel"].setValue("deep.front")
+        # The depth-AA toggle is named ``filter_type`` / ``aa`` depending
+        # on the build. ``aa`` on ZDefocus2 is the spatial-AA-on-depth
+        # checkbox; force it off either way.
+        for aa_knob in ("aa", "depth_aa"):
+            k = zdf.knob(aa_knob)
+            if k is not None:
+                with contextlib.suppress(Exception):
+                    k.setValue(False)
+
+        out_node = nuke.nodes.Output(name="out_main")
+        out_node.setInput(0, zdf)
+
+        member_names["vector_blur"] = vblur.name() if vblur is not None else None
+        member_names["recolor"] = recolor["name"]
+        member_names["holdout"] = holdout["name"]
+        member_names["merge"] = merge["name"]
+        member_names["flatten"] = flatten["name"]
+        member_names["grade"] = grade.name()
+        member_names["ocio_in"] = ocio_in.name()
+        member_names["ocio_out"] = ocio_out.name()
+        member_names["zdefocus"] = zdf.name()
+
+    # Wire the group's external inputs.
+    group.setInput(0, deep_node)
+    group.setInput(1, beauty_node)
+    next_slot = 2
+    if holdout_node is not None:
+        group.setInput(next_slot, holdout_node)
+        next_slot += 1
+    if motion_node is not None:
+        group.setInput(next_slot, motion_node)
+
+    return {
+        "group": group.name(),
+        "recolor": member_names["recolor"],
+        "holdout": member_names["holdout"],
+        "merge": member_names["merge"],
+        "flatten": member_names["flatten"],
+        "grade": member_names["grade"],
+        "vector_blur": member_names["vector_blur"],
+        "zdefocus": member_names["zdefocus"],
+    }
+
+
+def _flip_blood_payload_from_group(group: Any) -> dict:
+    """Re-derive the macro's return payload from an existing Group.
+
+    Used on the idempotent re-call path. The Group's name acts as a
+    prefix for every member ('foo_recolor', 'foo_grade' etc.) so we
+    can rebuild the payload by lookup rather than re-serialising the
+    whole group's children.
+    """
+    base = group.name()
+    vblur = group.node(f"{base}_vblur")
+    return {
+        "group": base,
+        "recolor": f"{base}_recolor",
+        "holdout": f"{base}_holdout",
+        "merge": f"{base}_merge",
+        "flatten": f"{base}_flatten",
+        "grade": f"{base}_grade",
+        "vector_blur": vblur.name() if vblur is not None else None,
+        "zdefocus": f"{base}_zdefocus",
+    }
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -2306,4 +2595,6 @@ HANDLERS: dict[str, Any] = {
     "create_deep_holdout": _handle_create_deep_holdout,
     "create_deep_transform": _handle_create_deep_transform,
     "deep_to_image": _handle_deep_to_image,
+    # C6 deep workflow macro
+    "setup_flip_blood_comp": _handle_setup_flip_blood_comp,
 }
