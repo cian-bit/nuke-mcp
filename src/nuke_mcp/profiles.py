@@ -169,6 +169,22 @@ PROFILES: dict[str, list[str]] = {
         "audit_render_settings",
         "qc_viewer_pair",
     ],
+    # C8 Salt Spill macros: 10 flag-planters that compose the C2-C7 +
+    # C9 primitives into the production-shaped graphs an artist would
+    # otherwise wire by hand. Every macro emits a wrapper Group + a
+    # Backdrop labelled with the shot code + tool version.
+    "salt_spill": [
+        "setup_karma_aov_pipeline_ss",
+        "setup_flip_blood_comp_ss",
+        "setup_sand_dust_layer",
+        "setup_salt_structure_relight",
+        "setup_dehaze_copycat_ss",
+        "setup_smartvector_paint_propagate_ss",
+        "setup_spaceship_track_patch_ss",
+        "setup_scream_shot_lensflare",
+        "audit_comp_for_acescct_consistency_ss",
+        "bake_lens_distortion_envelope_ss",
+    ],
 }
 
 
@@ -202,6 +218,12 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "audit": (
         "Read-only QC scans (write paths, naming, render settings, "
         "ACEScct consistency) plus a Switch+Grade visual-diff builder."
+    ),
+    "salt_spill": (
+        "Salt Spill comp flag-planters: 10 macros (Karma AOV, FLIP "
+        "blood, sand/dust, salt relight, dehaze CopyCat, SmartVector "
+        "paint, spaceship patch, scream lensflare, ACEScct audit, "
+        "lens-distortion envelope) wrapped under per-shot Groups."
     ),
 }
 
