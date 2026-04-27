@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import socket
 import threading
@@ -941,6 +942,8 @@ class MockNukeServer:
             "bake_tracker_to_corner_pin": self._bake_tracker_to_corner_pin,
             "solve_3d_camera": self._solve_3d_camera,
             "bake_camera_to_card": self._bake_camera_to_card,
+            # C5 tracking workflow macros
+            "setup_spaceship_track_patch": self._setup_spaceship_track_patch,
             # C1 deep primitives
             "create_deep_recolor": self._create_deep_recolor,
             "create_deep_merge": self._create_deep_merge,
@@ -1704,6 +1707,178 @@ class MockNukeServer:
             knobs={"frame": frame},
         )
         return self._node_ref_from_state(new_name)
+
+    # ------------------------------------------------------------------
+    # C5 tracking workflow macros (setup_spaceship_track_patch)
+    #
+    # Mirrors the addon-side handler: validates surface_type, derives a
+    # shot tag from $SS_SHOT or the script_info path, composes the C1
+    # typed sub-handlers so ``typed_calls`` records the underlying
+    # primitives the macro invokes, and registers the Group + member
+    # sub-nodes in ``self.nodes``.
+    # ------------------------------------------------------------------
+
+    _SURFACE_TYPES = frozenset({"planar", "3d"})
+
+    def _derive_shot_tag(self) -> str:
+        raw = os.environ.get("SS_SHOT") or ""
+        if not raw:
+            script_path = self.script_info.get("script") or ""
+            if script_path:
+                raw = pathlib.Path(script_path).stem
+        if not raw:
+            raw = "unsaved"
+        cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in raw)
+        return cleaned or "unsaved"
+
+    def _setup_spaceship_track_patch(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_spaceship_track_patch", dict(p)))
+        plate_name = p["plate"]
+        ref_frame = int(p["ref_frame"])
+        surface_type = p.get("surface_type", "planar")
+        patch_source = p.get("patch_source")
+        explicit_name = p.get("name")
+
+        if surface_type not in self._SURFACE_TYPES:
+            raise ValueError(f"invalid surface_type: {surface_type!r} (expected 'planar' or '3d')")
+        if plate_name not in self.nodes:
+            raise ValueError(f"plate node not found: {plate_name}")
+        if patch_source is not None and patch_source not in self.nodes:
+            raise ValueError(f"patch_source node not found: {patch_source}")
+
+        group_name = explicit_name or f"SpaceshipPatch_{self._derive_shot_tag()}"
+
+        existing = self.nodes.get(group_name)
+        if existing is not None:
+            if existing["type"] != "Group":
+                raise ValueError(
+                    f"node '{group_name}' exists but is class '{existing['type']}', "
+                    "expected 'Group'"
+                )
+            return self._node_ref_from_state(group_name)
+
+        members: list[str] = []
+
+        # Group input plate handle (mirrors the addon-side ``Input`` node
+        # inside the Group context).
+        plate_in = self._register_node("Input", None, f"{group_name}_plateIn", [])
+        members.append(plate_in)
+
+        if surface_type == "planar":
+            roto_plane = self._register_node(
+                "Roto", f"{group_name}_plane", f"{group_name}_plane", [plate_in]
+            )
+            members.append(roto_plane)
+            planar_ref = self._setup_planar_tracker(
+                {
+                    "input_node": plate_in,
+                    "plane_roto": roto_plane,
+                    "ref_frame": ref_frame,
+                    "name": f"{group_name}_planar",
+                }
+            )
+            members.append(planar_ref["name"])
+            forward_pin = self._bake_tracker_to_corner_pin(
+                {
+                    "tracker_node": planar_ref["name"],
+                    "ref_frame": ref_frame,
+                    "name": f"{group_name}_pinFwd",
+                }
+            )
+            members.append(forward_pin["name"])
+            if patch_source is not None:
+                patch_root_name = patch_source
+            else:
+                patch_root_name = self._register_node(
+                    "RotoPaint",
+                    f"{group_name}_paint",
+                    f"{group_name}_paint",
+                    [forward_pin["name"]],
+                )
+            members.append(patch_root_name)
+            restore_pin = self._register_node(
+                "CornerPin2D",
+                f"{group_name}_pinRestore",
+                f"{group_name}_pinRestore",
+                [patch_root_name],
+                knobs={"reference_frame": ref_frame, "invert": True},
+            )
+            members.append(restore_pin)
+            output_input = restore_pin
+        else:
+            camtrack_ref = self._setup_camera_tracker(
+                {
+                    "input_node": plate_in,
+                    "name": f"{group_name}_camTrack",
+                }
+            )
+            members.append(camtrack_ref["name"])
+            solved_ref = self._solve_3d_camera(
+                {
+                    "camera_tracker_node": camtrack_ref["name"],
+                    "name": f"{group_name}_camTrack",
+                }
+            )
+            members.append(solved_ref["name"])
+            card_ref = self._bake_camera_to_card(
+                {
+                    "camera_node": solved_ref["name"],
+                    "frame": ref_frame,
+                    "name": f"{group_name}_card",
+                }
+            )
+            members.append(card_ref["name"])
+            if patch_source is not None:
+                patch_root_name = patch_source
+            else:
+                patch_root_name = self._register_node(
+                    "RotoPaint",
+                    f"{group_name}_paint",
+                    f"{group_name}_paint",
+                    [plate_in],
+                )
+            members.append(patch_root_name)
+            project_name = self._register_node(
+                "Project3D",
+                f"{group_name}_project3D",
+                f"{group_name}_project3D",
+                [patch_root_name, solved_ref["name"]],
+            )
+            members.append(project_name)
+            scanline_name = self._register_node(
+                "ScanlineRender",
+                f"{group_name}_scanline",
+                f"{group_name}_scanline",
+                [None, card_ref["name"], solved_ref["name"]],
+            )
+            members.append(scanline_name)
+            merge_name = self._register_node(
+                "Merge2",
+                f"{group_name}_merge",
+                f"{group_name}_merge",
+                [plate_in, scanline_name],
+                knobs={"operation": "over"},
+            )
+            members.append(merge_name)
+            output_input = merge_name
+
+        # Group output node closing the inner graph.
+        group_output = self._register_node("Output", None, f"{group_name}_out", [output_input])
+        members.append(group_output)
+
+        # The Group itself takes the plate as its single external input.
+        self.nodes[group_name] = {
+            "type": "Group",
+            "knobs": {"surface_type": surface_type},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[group_name] = [plate_name]
+
+        ref = self._node_ref_from_state(group_name)
+        ref["surface_type"] = surface_type
+        ref["members"] = members
+        return ref
 
     def _create_deep_recolor(self, p: dict) -> dict:
         self.typed_calls.append(("create_deep_recolor", dict(p)))
