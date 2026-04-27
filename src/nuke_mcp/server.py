@@ -1,13 +1,24 @@
-"""FastMCP server for Nuke. Registers tools and handles transport."""
+"""FastMCP server for Nuke. Registers tools and handles transport.
+
+Phase B4: tool registration is paginated by skill profile. Every tool
+module always runs ``register(ctx)`` at boot so the tool object exists
+in FastMCP's registry, but tools whose ``_profile`` is not in
+``active_profiles`` get disabled (via ``mcp.disable(names=...)``)
+before the server hits the wire. Loading a profile at runtime --
+``load_profile("tracking")`` -- flips the disabled flag back on and
+emits a ``notifications/tools/list_changed`` so the model resyncs.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 
 from fastmcp import FastMCP
 
 from nuke_mcp import connection
+from nuke_mcp.profiles import DEFAULT_PROFILES, PROFILES
 from nuke_mcp.tools import (
     channels,
     code,
@@ -24,6 +35,9 @@ from nuke_mcp.tools import (
     tracking,
     viewer,
 )
+from nuke_mcp.tools import (
+    profiles as profiles_tools,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +45,67 @@ NUKE_HOST = os.environ.get("NUKE_HOST", "localhost")
 NUKE_PORT = int(os.environ.get("NUKE_PORT", "9876"))
 
 
-def build_server(mock: bool = False) -> FastMCP:
+def _names_for_profiles(profiles: Iterable[str]) -> set[str]:
+    """Flatten a list of profile names into a set of tool names.
+
+    Unknown profile names are silently ignored -- ``register_tools``
+    has the loud-fail path; this helper is meant for the inner
+    enable/disable diff which should be tolerant.
+    """
+    names: set[str] = set()
+    for profile in profiles:
+        names.update(PROFILES.get(profile, []))
+    return names
+
+
+def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = None) -> None:
+    """Register every tool module then disable tools outside ``active_profiles``.
+
+    ``active_profiles=None`` (the default) loads :data:`DEFAULT_PROFILES`
+    -- ``"core"``. The disable step uses FastMCP's ``mcp.disable(names=...)``
+    which adds a visibility transform; ``load_profile`` reverses it via
+    ``mcp.enable(names=...)`` at runtime.
+
+    Tools whose profile name isn't in :data:`PROFILES` at all (which
+    would only happen if someone added a new profile to the registry
+    decorator without updating ``profiles.PROFILES``) get a warning
+    log and are left enabled -- never silently dropped.
+    """
+    profiles = list(active_profiles) if active_profiles is not None else list(DEFAULT_PROFILES)
+
+    read.register(ctx)
+    graph.register(ctx)
+    knobs.register(ctx)
+    script.register(ctx)
+    render.register(ctx)
+    channels.register(ctx)
+    viewer.register(ctx)
+    code.register(ctx)
+    comp.register(ctx)
+    expressions.register(ctx)
+    roto.register(ctx)
+    digest.register(ctx)
+    tracking.register(ctx)
+    deep.register(ctx)
+    profiles_tools.register(ctx)
+
+    # Diff: every tool listed in PROFILES that isn't part of an active
+    # profile gets disabled. Tools missing from PROFILES entirely log a
+    # warning -- the catalog must list every registered tool for B4
+    # introspection to be sound.
+    all_known_tools: set[str] = set()
+    for tools in PROFILES.values():
+        all_known_tools.update(tools)
+    active_names = _names_for_profiles(profiles)
+    to_disable = all_known_tools - active_names
+    if to_disable:
+        ctx.mcp.disable(names=to_disable)
+
+
+def build_server(
+    mock: bool = False,
+    active_profiles: Iterable[str] | None = None,
+) -> FastMCP:
     mcp = FastMCP(
         "nuke-mcp",
         instructions=(
@@ -62,21 +136,7 @@ def build_server(mock: bool = False) -> FastMCP:
             )
 
     ctx = ServerContext(mcp=mcp, version=version, mock=mock)
-
-    read.register(ctx)
-    graph.register(ctx)
-    knobs.register(ctx)
-    script.register(ctx)
-    render.register(ctx)
-    channels.register(ctx)
-    viewer.register(ctx)
-    code.register(ctx)
-    comp.register(ctx)
-    expressions.register(ctx)
-    roto.register(ctx)
-    digest.register(ctx)
-    tracking.register(ctx)
-    deep.register(ctx)
+    register_tools(ctx, active_profiles=active_profiles)
 
     return mcp
 

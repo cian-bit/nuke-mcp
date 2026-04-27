@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import BENIGN_NEW, READ_ONLY
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -11,10 +12,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("list_channels")
     def list_channels(node: str) -> dict:
         """List all channels/layers available at a node's output, grouped by layer.
@@ -25,7 +23,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("list_channels", node=node)
 
     # ``shuffle_channels`` creates a fresh Shuffle2 node -- not idempotent.
-    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("shuffle_channels")
     def shuffle_channels(
         input_node: str,
@@ -53,7 +51,7 @@ __result__ = {{"name": s.name(), "from": {from_layer!r}, "to": {to_layer!r}}}
         return connection.send("execute_python", code=code)
 
     # ``setup_aov_merge`` creates fresh Merge2 chain nodes -- not idempotent.
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="aov", annotations=BENIGN_NEW)
     @nuke_command("setup_aov_merge")
     def setup_aov_merge(read_nodes: str) -> dict:
         """Merge multiple AOV Read nodes together (additive). Common EXR workflow.

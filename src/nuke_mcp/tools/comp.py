@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from nuke_mcp.annotations import BENIGN_NEW
 from nuke_mcp.main_thread import run_on_main
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -19,7 +20,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="color", annotations=BENIGN_NEW)
     @nuke_command("setup_keying")
     def setup_keying(input_node: str, keyer_type: str = "Keylight") -> dict:
         """Set up a keying pipeline: keyer, erode, edge blur, premult.
@@ -34,7 +35,7 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="color", annotations=BENIGN_NEW)
     @nuke_command("setup_color_correction")
     def setup_color_correction(input_node: str, operation: str = "Grade") -> dict:
         """Create a color correction node connected to the input.
@@ -49,7 +50,7 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("setup_merge")
     def setup_merge(
         fg: str,
@@ -69,7 +70,7 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("setup_transform")
     def setup_transform(input_node: str, operation: str = "Transform") -> dict:
         """Create a transform node.
@@ -84,7 +85,7 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("setup_denoise")
     def setup_denoise(input_node: str) -> dict:
         """Create a Denoise node with production defaults.

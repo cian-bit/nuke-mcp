@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import READ_ONLY
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -26,7 +27,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=READ_ONLY, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("scene_digest")
     def scene_digest() -> dict:
         """Compact fingerprint of the script: counts by class, errors,
@@ -38,7 +39,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("scene_digest")
 
-    @ctx.mcp.tool(annotations=READ_ONLY, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("scene_delta")
     def scene_delta(prev_hash: str) -> dict:
         """Compare current scene state against a previous hash.

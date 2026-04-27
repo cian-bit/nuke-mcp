@@ -16,6 +16,7 @@ from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
 from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.models import RenderResult
 from nuke_mcp.models._warnings import warn_once
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -30,7 +31,7 @@ def _model_dump(model: Any) -> dict[str, Any]:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("setup_write")
     def setup_write(
         input_node: str,
@@ -61,9 +62,11 @@ def register(ctx: ServerContext) -> None:
             "mutate",
         )
 
-    @ctx.mcp.tool(
+    @nuke_tool(
+        ctx,
+        profile="core",
         annotations=DESTRUCTIVE | OPEN_WORLD,
-        output_schema=None,
+        output_model=RenderResult,
     )
     @nuke_command("render_frames")
     def render_frames(
@@ -110,9 +113,9 @@ def register(ctx: ServerContext) -> None:
                 return result
         return result
 
-    # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
-    # ``destructiveHint=False`` so the schema explicitly marks it benign.
-    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
+    # ``setup_precomp`` creates new Read+Write nodes -- not idempotent.
+    # ``BENIGN_NEW`` carries the explicit ``destructiveHint=False``.
+    @nuke_tool(ctx, profile="core", annotations=BENIGN_NEW)
     @nuke_command("setup_precomp")
     def setup_precomp(
         source_node: str,
@@ -191,10 +194,7 @@ __result__ = {{
 """
         return connection.send("execute_python", code=code)
 
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("list_precomps")
     def list_precomps() -> dict:
         """Find all precomp Write/Read pairs in the script."""

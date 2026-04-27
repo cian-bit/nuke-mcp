@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from nuke_mcp.annotations import BENIGN_NEW
 from nuke_mcp.main_thread import run_on_main
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -28,7 +29,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("setup_camera_tracker")
     def setup_camera_tracker(
         input_node: str,
@@ -59,7 +60,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("setup_camera_tracker", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("setup_planar_tracker")
     def setup_planar_tracker(
         input_node: str,
@@ -84,7 +85,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("setup_planar_tracker", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("setup_tracker4")
     def setup_tracker4(
         input_node: str,
@@ -106,7 +107,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("setup_tracker4", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("bake_tracker_to_corner_pin")
     def bake_tracker_to_corner_pin(
         tracker_node: str,
@@ -128,7 +129,7 @@ def register(ctx: ServerContext) -> None:
             params["name"] = name
         return run_on_main("bake_tracker_to_corner_pin", params, "mutate")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("solve_3d_camera")
     def solve_3d_camera(
         camera_tracker_node: str,
@@ -148,7 +149,7 @@ def register(ctx: ServerContext) -> None:
         # solving can take a while in Nuke -- bump the timeout class.
         return run_on_main("solve_3d_camera", params, "render")
 
-    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
+    @nuke_tool(ctx, profile="tracking", annotations=BENIGN_NEW)
     @nuke_command("bake_camera_to_card")
     def bake_camera_to_card(
         camera_node: str,

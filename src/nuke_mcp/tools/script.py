@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
-from nuke_mcp.annotations import DESTRUCTIVE, IDEMPOTENT, OPEN_WORLD, READ_ONLY
+from nuke_mcp.annotations import DESTRUCTIVE_OPEN, IDEMPOTENT, OPEN_WORLD, READ_ONLY
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -11,16 +12,13 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(
-        annotations=READ_ONLY,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=READ_ONLY)
     @nuke_command("get_script_info")
     def get_script_info() -> dict:
         """Get current script metadata: path, frame range, fps, format, colorspace, node count."""
         return connection.send("get_script_info")
 
-    @ctx.mcp.tool(annotations=OPEN_WORLD, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=OPEN_WORLD)
     @nuke_command("save_script")
     def save_script(path: str | None = None) -> dict:
         """Save the script. If path is given, saves as a new file.
@@ -33,10 +31,7 @@ def register(ctx: ServerContext) -> None:
             params["path"] = path
         return connection.send("save_script", **params)
 
-    @ctx.mcp.tool(
-        annotations=DESTRUCTIVE | OPEN_WORLD,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="core", annotations=DESTRUCTIVE_OPEN)
     @nuke_command("load_script")
     def load_script(path: str, confirm: bool = False) -> dict:
         """Open a Nuke script. Replaces current script.
@@ -51,7 +46,7 @@ def register(ctx: ServerContext) -> None:
             }
         return connection.send("load_script", path=path)
 
-    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
+    @nuke_tool(ctx, profile="core", annotations=IDEMPOTENT)
     @nuke_command("set_frame_range")
     def set_frame_range(
         first: int | None = None,

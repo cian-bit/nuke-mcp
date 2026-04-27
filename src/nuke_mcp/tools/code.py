@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 
 from nuke_mcp import connection
-from nuke_mcp.annotations import DESTRUCTIVE, OPEN_WORLD
+from nuke_mcp.annotations import DESTRUCTIVE_OPEN
+from nuke_mcp.registry import nuke_tool
 from nuke_mcp.tools import _safety
 from nuke_mcp.tools._helpers import nuke_command
 
@@ -16,10 +17,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(
-        annotations=DESTRUCTIVE | OPEN_WORLD,
-        output_schema=None,
-    )
+    @nuke_tool(ctx, profile="graph_advanced", annotations=DESTRUCTIVE_OPEN)
     @nuke_command("execute_python")
     def execute_python(
         code: str,
