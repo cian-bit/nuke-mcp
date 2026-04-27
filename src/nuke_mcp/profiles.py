@@ -145,6 +145,19 @@ PROFILES: dict[str, list[str]] = {
         "apply_smartvector_propagate",
         "generate_stmap",
     ],
+    # C7: CopyCat training + Cattery model registry. Training is
+    # multi-hour, so the train/install tools route through the B2 Task
+    # primitive (return task_id, stream progress notifications).
+    # ``serve_copycat`` and ``list_cattery_models`` are synchronous
+    # but live in the same profile -- a session that's about to train
+    # also wants the inference-side wiring helper at hand.
+    "copycat": [
+        "train_copycat",
+        "serve_copycat",
+        "setup_dehaze_copycat",
+        "list_cattery_models",
+        "install_cattery_model",
+    ],
 }
 
 
@@ -170,6 +183,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "distortion": (
         "Lens-distortion / STMap envelope + SmartVector propagate. "
         "Wraps comps in undistorted-linear, bakes vectors as Tasks."
+    ),
+    "copycat": (
+        "CopyCat ML training + Cattery model registry. Training tools "
+        "are async Tasks; inference + listing are synchronous."
     ),
 }
 

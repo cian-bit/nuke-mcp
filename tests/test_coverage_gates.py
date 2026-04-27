@@ -46,6 +46,10 @@ _GATES: tuple[tuple[str, float], ...] = (
     # recovery) that fire only under operator error.
     ("tasks.py", 85.0),
     ("tools/tasks.py", 85.0),
+    # C7: ml.py defensive log path on listener exceptions stays
+    # uncovered; everything else is exercised. 90% leaves headroom
+    # for follow-up edge cases without churning the gate.
+    ("tools/ml.py", 90.0),
 )
 
 

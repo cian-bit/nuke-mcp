@@ -825,6 +825,17 @@ class MockNukeServer:
         # routing without parsing the cmd back out of a shared log.
         self.async_smartvectors: list[dict] = []
         self.async_stmaps: list[dict] = []
+        # C7 CopyCat / Cattery: same wire-recording pattern. The
+        # train/install handlers don't actually train -- they just
+        # record the call and ack. Tests inject task_progress
+        # notifications via the queue to drive the listener.
+        self.async_trains: list[dict] = []
+        self.async_installs: list[dict] = []
+        self.cancelled_copycats: list[str | None] = []
+        self.cancelled_installs: list[str | None] = []
+        # In-memory Cattery cache returned by list_cattery_models.
+        # Tests pre-populate to assert filtering behaviour.
+        self.cattery_models: list[dict[str, Any]] = []
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -997,6 +1008,14 @@ class MockNukeServer:
             "generate_stmap_async": self._generate_stmap_async,
             # C6 deep workflow macro
             "setup_flip_blood_comp": self._setup_flip_blood_comp,
+            # C7 ML / Cattery
+            "train_copycat_async": self._train_copycat_async,
+            "setup_dehaze_copycat_async": self._setup_dehaze_copycat_async,
+            "install_cattery_model_async": self._install_cattery_model_async,
+            "serve_copycat": self._serve_copycat,
+            "list_cattery_models": self._list_cattery_models,
+            "cancel_copycat": self._cancel_copycat,
+            "cancel_install": self._cancel_install,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -1573,15 +1592,13 @@ class MockNukeServer:
         existing = self.nodes[name]
         if existing["type"] != node_class:
             raise ValueError(
-                f"node '{name}' exists but is class '{existing['type']}', "
-                f"expected '{node_class}'"
+                f"node '{name}' exists but is class '{existing['type']}', expected '{node_class}'"
             )
         actual_inputs = list(self.connections.get(name, []))
         leading = actual_inputs[: len(expected_inputs)]
         if leading != expected_inputs:
             raise ValueError(
-                f"node '{name}' exists but has inputs {actual_inputs}, "
-                f"expected {expected_inputs}"
+                f"node '{name}' exists but has inputs {actual_inputs}, expected {expected_inputs}"
             )
         return self._node_ref_from_state(name)
 
@@ -1724,7 +1741,7 @@ class MockNukeServer:
         existing = self.nodes[tracker_node]
         if existing["type"] != "CameraTracker":
             raise ValueError(
-                f"node '{tracker_node}' is class '{existing['type']}', " f"expected CameraTracker"
+                f"node '{tracker_node}' is class '{existing['type']}', expected CameraTracker"
             )
         # Idempotent: solving doesn't create a new node, it just marks
         # the existing one solved. Optionally rename to ``name``.
@@ -2859,6 +2876,77 @@ class MockNukeServer:
             "vector_blur": vblur_name,
             "zdefocus": zdf_name,
         }
+
+    # ------------------------------------------------------------------
+    # C7 ML / Cattery handlers
+    #
+    # CRITICAL: training is multi-hour wall time on real Nuke; these
+    # mocks never spawn a worker. They record the wire payload + ack
+    # and return immediately. Tests drive progress + completion by
+    # injecting task_progress notifications via the connection's
+    # notification_queue() directly, never by waiting on the mock.
+    # ------------------------------------------------------------------
+
+    def _train_copycat_async(self, p: dict) -> dict:
+        """Mock train dispatch. Does NOT train. Records and acks only."""
+        self.async_trains.append(dict(p))
+        return {"task_id": p.get("task_id"), "started": True}
+
+    def _setup_dehaze_copycat_async(self, p: dict) -> dict:
+        """Mock dehaze dispatch. Inverse training -- in/out swapped."""
+        self.async_trains.append(dict(p))
+        return {"task_id": p.get("task_id"), "started": True}
+
+    def _install_cattery_model_async(self, p: dict) -> dict:
+        """Mock Cattery install. Does NOT download. Records + acks."""
+        self.async_installs.append(dict(p))
+        return {"task_id": p.get("task_id"), "started": True}
+
+    def _serve_copycat(self, p: dict) -> dict:
+        """Synchronous: wire an Inference node to the plate."""
+        self.typed_calls.append(("serve_copycat", dict(p)))
+        plate = p["plate"]
+        model_path = p["model_path"]
+        name = p.get("name")
+        if plate not in self.nodes:
+            raise ValueError(f"plate not found: {plate}")
+        expected_inputs = [plate]
+        cached = self._try_idempotent(name, "Inference", expected_inputs)
+        # Verify the model_path matches; idempotent re-call must be on
+        # the SAME model. Falling through creates a fresh node when the
+        # model_path differs, so we drop the cached ref in that case.
+        if cached is not None and cached.get("knobs", {}).get("model_path") not in (
+            None,
+            model_path,
+        ):
+            cached = None
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "Inference",
+            name,
+            "Inference1",
+            expected_inputs,
+            knobs={"model_path": model_path},
+        )
+        return self._node_ref_from_state(new_name)
+
+    def _list_cattery_models(self, p: dict) -> dict:
+        """Filter the in-memory Cattery cache by category substring."""
+        category = p.get("category")
+        if category is not None:
+            filtered = [m for m in self.cattery_models if category in m.get("category", "")]
+        else:
+            filtered = list(self.cattery_models)
+        return {"models": filtered, "count": len(filtered)}
+
+    def _cancel_copycat(self, p: dict) -> dict:
+        self.cancelled_copycats.append(p.get("task_id"))
+        return {"cancelled": True, "task_id": p.get("task_id")}
+
+    def _cancel_install(self, p: dict) -> dict:
+        self.cancelled_installs.append(p.get("task_id"))
+        return {"cancelled": True, "task_id": p.get("task_id")}
 
 
 @pytest.fixture(autouse=True)
