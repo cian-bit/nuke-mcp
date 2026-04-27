@@ -75,7 +75,10 @@ def register(ctx: ServerContext) -> None:
             params["write_node"] = write_node
         if first_frame is not None and last_frame is not None:
             params["frame_range"] = [first_frame, last_frame]
-        return connection.send_raw("render", timeout=300.0, **params)
+        # render = non-idempotent (writes frames). 900s class timeout
+        # via TIMEOUT_CLASSES["render"] -- removes the prior 300s magic
+        # number and routes the call through the same envelope as send().
+        return connection.send("render", _class="render", **params)
 
     # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
     # ``destructiveHint=False`` so the schema explicitly marks it benign.

@@ -381,3 +381,141 @@ def test_helpers_decorator_formats_envelope(connected):
     assert "duration_ms" in out
     assert "request_id" in out
     assert len(out["request_id"]) == 16
+
+
+# -- GPT-5.5 #4: replay guard for non-idempotent ops --
+
+
+def test_send_mutate_does_not_replay_after_connection_loss(connected, monkeypatch):
+    """A mutate-class send must NOT auto-replay after the first-attempt
+    socket failure. The risk is that the addon already executed the op
+    before the connection died, and a replay creates duplicates.
+    """
+    calls: list[dict] = []
+
+    def boom_then_fail(msg, timeout):
+        # Simulate a connection lost on the first (and only) attempt.
+        calls.append(msg)
+        raise ConnectionError("simulated socket loss")
+
+    monkeypatch.setattr(connection, "_io_round_trip", boom_then_fail)
+
+    with pytest.raises(connection.ConnectionLostError) as ei:
+        connection.send("setup_keying", _class="mutate", input_node="plate")
+    err = ei.value
+    assert err.last_op == "setup_keying"
+    assert err.last_class == "mutate"
+    assert err.last_request_id is not None and len(err.last_request_id) == 16
+    # CRUCIAL: the round-trip was attempted exactly once -- no replay.
+    assert len(calls) == 1
+
+
+def test_send_render_class_does_not_replay(connected, monkeypatch):
+    """Render is also non-idempotent; same guard applies."""
+    calls: list[dict] = []
+
+    def boom(msg, timeout):
+        calls.append(msg)
+        raise ConnectionError("simulated socket loss")
+
+    monkeypatch.setattr(connection, "_io_round_trip", boom)
+
+    with pytest.raises(connection.ConnectionLostError):
+        connection.send("render", _class="render")
+    assert len(calls) == 1
+
+
+def test_send_read_class_still_replays_on_connection_loss(connected, monkeypatch):
+    """Read paths are idempotent and SHOULD auto-retry on transient
+    socket loss -- preserves the prior auto-reconnect behaviour for
+    safe ops.
+    """
+    real_round_trip = connection._io_round_trip
+    fail_first = {"done": False}
+
+    def flaky(msg, timeout):
+        if not fail_first["done"]:
+            fail_first["done"] = True
+            raise ConnectionError("transient")
+        return real_round_trip(msg, timeout)
+
+    monkeypatch.setattr(connection, "_io_round_trip", flaky)
+    # The reconnect path needs to find _last_host/_port; the connected
+    # fixture has set them already.
+    out = connection.send("get_script_info", _class="read")
+    assert out["fps"] == 24.0
+
+
+# -- GPT-5.5 #5: send_raw + render_frames --
+
+
+def test_render_frames_uses_render_class(connected, monkeypatch):
+    """``render_frames`` must dispatch with ``_class='render'`` (900s)
+    instead of the old ``timeout=300.0`` literal, and must raise the
+    non-idempotent guard rather than replay on connection loss.
+    """
+    captured: list[float] = []
+    real_round_trip = connection._io_round_trip
+
+    def spy(msg, timeout):
+        captured.append(timeout)
+        return real_round_trip(msg, timeout)
+
+    monkeypatch.setattr(connection, "_io_round_trip", spy)
+    connection.send("render", _class="render")
+    assert captured == [900.0]
+
+
+def test_send_raw_custom_timeout_validates_request_id(connected):
+    """``send_raw`` with a non-class timeout must still echo-check the
+    request_id and surface a structured envelope on error.
+    """
+    with pytest.raises(connection.CommandError) as ei:
+        connection.send_raw("nonexistent_command", timeout=2.5)
+    env = ei.value.envelope
+    assert env.get("error_class") == "CommandError"
+    assert "duration_ms" in env
+    assert len(env["request_id"]) == 16
+
+
+def test_send_raw_custom_timeout_request_id_mismatch_raises(connected):
+    """A spoofed echo on the custom-timeout path must trigger the same
+    ``request_id mismatch`` ConnectionError as the main send path.
+    """
+    server = connected
+    original_dispatch = server._dispatch
+
+    def bad_dispatch(msg):
+        resp = original_dispatch(msg)
+        resp["_request_id"] = "deadbeefdeadbeef"
+        return resp
+
+    server._dispatch = bad_dispatch
+    with pytest.raises(connection.ConnectionError, match="request_id mismatch"):
+        connection.send_raw("get_script_info", timeout=2.5)
+
+
+# -- GPT-5.5 #6: heartbeat self-join guard --
+
+
+def test_stop_heartbeat_called_from_heartbeat_thread_does_not_raise():
+    """When ``_stop_heartbeat`` is invoked from the heartbeat thread
+    itself (e.g. via the disconnect inside ``_heartbeat_loop``), joining
+    must be skipped to avoid ``RuntimeError: cannot join current thread``.
+    """
+    # Prime the module state with a fake "heartbeat" thread that is the
+    # current thread. _stop_heartbeat must not call join() on itself.
+    connection._heartbeat_thread = threading.current_thread()
+    connection._heartbeat_stop = threading.Event()
+    try:
+        # This must not raise.
+        connection._stop_heartbeat()
+    finally:
+        connection._heartbeat_thread = None
+        connection._heartbeat_stop = None
+
+
+def test_probe_executor_uses_four_workers():
+    """Houdini-MCP parity: probe pool sized for concurrent callers."""
+    pool = connection._get_probe_executor()
+    assert pool._max_workers == 4

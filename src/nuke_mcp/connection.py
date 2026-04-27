@@ -94,6 +94,30 @@ class CommandError(Exception):
         self.envelope: dict[str, Any] = envelope or {}
 
 
+class ConnectionLostError(ConnectionError):
+    """Raised when a non-idempotent send loses the connection mid-flight.
+
+    The addon may have already executed the command before the socket
+    died -- replaying the payload would risk creating duplicate nodes /
+    re-running a destructive op. Carries ``last_op`` and
+    ``last_request_id`` so the caller (or a future reconciler) can
+    decide what to do.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        last_op: str | None = None,
+        last_request_id: str | None = None,
+        last_class: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.last_op = last_op
+        self.last_request_id = last_request_id
+        self.last_class = last_class
+
+
 @dataclass
 class NukeVersion:
     major: int
@@ -252,8 +276,10 @@ def _reconnect() -> None:
 def _get_probe_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _probe_executor
     if _probe_executor is None:
+        # Houdini-MCP parity: 4 workers covers concurrent probes from
+        # tool calls and the heartbeat loop without queuing.
         _probe_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="nuke-mcp-probe"
+            max_workers=4, thread_name_prefix="nuke-mcp-probe"
         )
     return _probe_executor
 
@@ -325,9 +351,23 @@ def send(command: str, *, _class: str = "read", **params: Any) -> dict[str, Any]
 
     try:
         resp = _io_round_trip(msg, timeout)
-    except (ConnectionError, OSError, TimeoutError):
-        # one auto-reconnect attempt; this matches the prior behaviour
-        # but routed through the retry-aware _do_connect path.
+    except (ConnectionError, OSError, TimeoutError) as exc:
+        # Auto-replay is only safe for idempotent classes. ``mutate``,
+        # ``render``, ``copycat`` may have already executed addon-side
+        # before the socket died -- replaying would create duplicate
+        # nodes or re-run destructive ops. Raise a typed error and
+        # leave reconciliation to the caller.
+        if _class not in ("read", "ping"):
+            with contextlib.suppress(Exception):
+                disconnect()
+            raise ConnectionLostError(
+                f"connection lost during non-idempotent op '{command}' "
+                f"(class={_class}, request_id={rid}): {exc}",
+                last_op=command,
+                last_request_id=rid,
+                last_class=_class,
+            ) from exc
+        # Read paths still auto-retry: they're idempotent by definition.
         disconnect()
         _reconnect()
         assert _sock is not None
@@ -382,22 +422,40 @@ def _io_round_trip(msg: dict[str, Any], timeout: float) -> dict[str, Any]:
 def send_raw(command: str, timeout: float | None = None, **params: Any) -> dict[str, Any]:
     """Like send() but with a custom timeout. Kept for back-compat callers.
 
-    Prefer ``send(command, _class=...)`` for new code.
+    Prefer ``send(command, _class=...)`` for new code. The custom-timeout
+    branch performs the same request_id round-trip + structured error
+    envelope as ``send`` so callers don't lose envelope fields just
+    because they chose an off-spec timeout.
     """
     if _sock is None:
         raise ConnectionError("not connected to Nuke")
     if timeout is None:
         return send(command, **params)
     # map the explicit timeout onto a class lookup if it matches a known
-    # value, otherwise temporarily override on the socket.
+    # value, otherwise fall through to the custom-timeout path below.
     for name, value in TIMEOUT_CLASSES.items():
         if abs(value - timeout) < 1e-6:
             return send(command, _class=name, **params)
-    # custom timeout: piggyback on the socket-level override path
-    msg = {"type": command, "params": params, "_request_id": uuid.uuid4().hex[:16]}
+
+    rid = uuid.uuid4().hex[:16]
+    msg = {"type": command, "params": params, "_request_id": rid}
+    started = time.perf_counter()
     resp = _io_round_trip(msg, timeout)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    echoed_rid = resp.get("_request_id")
+    if echoed_rid is not None and echoed_rid != rid:
+        raise ConnectionError(f"request_id mismatch: sent {rid}, got {echoed_rid}")
+
     if resp.get("status") == "error":
-        raise CommandError(resp.get("error", "unknown error"))
+        envelope = {
+            "error_class": resp.get("error_class") or "CommandError",
+            "error_code": resp.get("error_code"),
+            "traceback": resp.get("traceback"),
+            "duration_ms": duration_ms,
+            "request_id": rid,
+        }
+        raise CommandError(resp.get("error", "unknown error"), envelope=envelope)
     return resp.get("result", {})
 
 
@@ -432,11 +490,20 @@ def _start_heartbeat() -> None:
 
 
 def _stop_heartbeat() -> None:
+    """Signal the heartbeat thread to exit and join it.
+
+    The heartbeat loop calls ``disconnect()`` from inside its own thread
+    when ``HEARTBEAT_MAX_MISSES`` is exceeded; ``disconnect()`` in turn
+    calls ``_stop_heartbeat()``. Joining a thread from itself raises
+    ``RuntimeError``, so the self-thread case skips the join and lets
+    the loop return naturally.
+    """
     global _heartbeat_thread, _heartbeat_stop
     if _heartbeat_stop is not None:
         _heartbeat_stop.set()
-    if _heartbeat_thread is not None:
-        _heartbeat_thread.join(timeout=1.0)
+    thread = _heartbeat_thread
+    if thread is not None and threading.current_thread() is not thread:
+        thread.join(timeout=1.0)
     _heartbeat_thread = None
     _heartbeat_stop = None
 
