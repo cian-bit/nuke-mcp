@@ -247,19 +247,25 @@ def _dispatch(msg: dict[str, Any], client: socket.socket | None = None) -> dict[
             resp["_request_id"] = rid
         return resp
 
-    # B2: async render returns immediately after spawning a worker.
-    if cmd == "render_async":
+    # B2: async commands return immediately after spawning a worker.
+    # Each entry maps an ``*_async`` command to a starter that records
+    # the task in ``_active_renders`` and spawns a background thread
+    # which emits ``task_progress`` notifications on the live socket.
+    # C4 widens this from a single ``render_async`` special-case to a
+    # registry so distortion / smartvector tasks can plug in.
+    async_starter = ASYNC_HANDLERS.get(cmd)
+    if async_starter is not None:
         if client is None:
             resp = {
                 "status": "error",
-                "error": "render_async requires the client socket",
+                "error": f"{cmd} requires the client socket",
                 "error_class": "ValueError",
             }
             if rid is not None:
                 resp["_request_id"] = rid
             return resp
         try:
-            result = _start_render_async(params, client)
+            result = async_starter(params, client)
             resp = {"status": "ok", "result": result}
         except Exception as e:
             resp = {
@@ -376,13 +382,30 @@ def _unregister_render(task_id: str) -> None:
 
 
 def _cancel_active_render(task_id: str) -> bool:
-    """Signal the worker for ``task_id`` to stop. Returns True if found."""
+    """Signal the worker for ``task_id`` to stop. Returns True if found.
+
+    Looks in both the render registry (``_active_renders``) and the
+    C4 distortion registry (``_active_distortion_tasks``) so a single
+    ``cancel_render`` covers SmartVector / STMap workers alongside the
+    original Write render workers without duplicating the entry point.
+    """
     with _active_renders_guard:
         stop = _active_renders.get(task_id)
-    if stop is None:
-        return False
-    stop.set()
-    return True
+    if stop is not None:
+        stop.set()
+        return True
+    # The dict won't be defined yet during initial module import (the
+    # distortion handlers are declared later in the file). Look it up
+    # via globals so the import-order dependency is explicit.
+    distortion_dict = globals().get("_active_distortion_tasks")
+    distortion_lock = globals().get("_active_distortion_tasks_guard")
+    if distortion_dict is not None and distortion_lock is not None:
+        with distortion_lock:
+            stop = distortion_dict.get(task_id)
+        if stop is not None:
+            stop.set()
+            return True
+    return False
 
 
 # knobs to skip in output -- ui-only, never useful for comp analysis
@@ -2251,6 +2274,442 @@ def _handle_deep_to_image(params: dict) -> dict:
     return _node_ref(n)
 
 
+# ---------------------------------------------------------------------------
+# C4: distortion / STMap envelope / SmartVector propagate
+# ---------------------------------------------------------------------------
+
+
+def _handle_bake_lens_distortion_envelope(params: dict) -> dict:
+    """Wrap the comp body in an undistorted-linear NetworkBox envelope.
+
+    The box label is ``LinearComp_undistorted_<plate>`` (or the explicit
+    ``name``). Inside the box: a head pair of LensDistortion ->
+    STMap(undistort) and a tail pair of STMap(redistort) -> Write.
+
+    Idempotent on ``name``: if a NetworkBox of the same name already
+    exists, return the cached ``{box, head, tail}`` dict.
+    """
+    import nuke
+
+    plate_name = params["plate"]
+    lens_solve_name = params["lens_solve"]
+    stmap_paths = params.get("stmap_paths") or {}
+    write_path = params.get("write_path")
+    explicit_name = params.get("name")
+    box_name = explicit_name or f"LinearComp_undistorted_{plate_name}"
+
+    plate = _resolve_node(plate_name)
+    if plate is None:
+        raise ValueError(f"plate node not found: {plate_name}")
+    lens_solve = _resolve_node(lens_solve_name)
+    if lens_solve is None:
+        raise ValueError(f"lens_solve node not found: {lens_solve_name}")
+
+    existing_box = nuke.toNode(box_name)
+    if existing_box is not None and existing_box.Class() == "BackdropNode":
+        # Idempotent re-call: surface the cached envelope. The head /
+        # tail node names are stamped with deterministic suffixes so
+        # we can find them without reverse-engineering box geometry.
+        head = nuke.toNode(f"{box_name}_head_lensdistortion")
+        head_stmap = nuke.toNode(f"{box_name}_head_stmap")
+        tail_stmap = nuke.toNode(f"{box_name}_tail_stmap")
+        write = nuke.toNode(f"{box_name}_write")
+        return {
+            "box": box_name,
+            "head": [n.name() for n in (head, head_stmap) if n is not None],
+            "tail": [n.name() for n in (tail_stmap, write) if n is not None],
+            "stmap_paths": stmap_paths,
+        }
+
+    # Head: LensDistortion -> STMap(undistort)
+    head_ld = nuke.nodes.LensDistortion()
+    head_ld.setName(f"{box_name}_head_lensdistortion")
+    head_ld.setInput(0, plate)
+    head_ld.setXYpos(plate.xpos(), plate.ypos() + 60)
+
+    head_stmap = nuke.nodes.STMap()
+    head_stmap.setName(f"{box_name}_head_stmap")
+    head_stmap.setInput(0, head_ld)
+    if head_stmap.knob("file") and stmap_paths.get("undistort"):
+        head_stmap["file"].setValue(stmap_paths["undistort"])
+    head_stmap.setXYpos(head_ld.xpos(), head_ld.ypos() + 60)
+
+    # Tail: STMap(redistort) -> Write
+    tail_stmap = nuke.nodes.STMap()
+    tail_stmap.setName(f"{box_name}_tail_stmap")
+    tail_stmap.setInput(0, head_stmap)
+    if tail_stmap.knob("file") and stmap_paths.get("redistort"):
+        tail_stmap["file"].setValue(stmap_paths["redistort"])
+    tail_stmap.setXYpos(head_stmap.xpos(), head_stmap.ypos() + 240)
+
+    write = nuke.nodes.Write()
+    write.setName(f"{box_name}_write")
+    write.setInput(0, tail_stmap)
+    if write_path and write.knob("file"):
+        write["file"].setValue(write_path)
+    write.setXYpos(tail_stmap.xpos(), tail_stmap.ypos() + 60)
+
+    # Wrap everything in a NetworkBox / BackdropNode so the operator
+    # sees a single labelled envelope around the four body nodes.
+    box = nuke.nodes.BackdropNode()
+    box.setName(box_name)
+    if box.knob("label"):
+        box["label"].setValue(box_name)
+    # Backdrop bounds: span the four nodes with a 40-px margin.
+    xs = [head_ld.xpos(), head_stmap.xpos(), tail_stmap.xpos(), write.xpos()]
+    ys = [head_ld.ypos(), head_stmap.ypos(), tail_stmap.ypos(), write.ypos()]
+    box.setXYpos(min(xs) - 40, min(ys) - 40)
+    if box.knob("bdwidth"):
+        box["bdwidth"].setValue(max(xs) - min(xs) + 200)
+    if box.knob("bdheight"):
+        box["bdheight"].setValue(max(ys) - min(ys) + 200)
+
+    return {
+        "box": box_name,
+        "head": [head_ld.name(), head_stmap.name()],
+        "tail": [tail_stmap.name(), write.name()],
+        "stmap_paths": stmap_paths,
+    }
+
+
+def _handle_apply_idistort(params: dict) -> dict:
+    """Create an IDistort fed by ``plate`` (slot 0) + ``vector_node`` (slot 1).
+
+    Pins ``uv.x`` / ``uv.y`` to the supplied channel names. Defaults
+    ride on the standard SmartVector layout (``forward.u``/``.v``).
+    Idempotent on ``name``.
+    """
+    import nuke
+
+    plate_name = params["plate"]
+    vector_name = params["vector_node"]
+    u_channel = params.get("u_channel", "forward.u")
+    v_channel = params.get("v_channel", "forward.v")
+    name = params.get("name")
+
+    plate = _resolve_node(plate_name)
+    if plate is None:
+        raise ValueError(f"plate node not found: {plate_name}")
+    vector = _resolve_node(vector_name)
+    if vector is None:
+        raise ValueError(f"vector_node not found: {vector_name}")
+
+    cached = _maybe_existing(name, "IDistort", [plate.name(), vector.name()])
+    if cached is not None:
+        return cached
+
+    n = nuke.nodes.IDistort()
+    n.setInput(0, plate)
+    n.setInput(1, vector)
+    if n.knob("uv"):
+        # The IDistort UV knob is a Channel_Knob that takes the layer
+        # base (``forward``); tools that want explicit forward.u /
+        # forward.v can set both halves of the channel name. Some
+        # builds expose ``channelsX`` / ``channelsY``; try both shapes.
+        with contextlib.suppress(Exception):
+            n["uv"].setValue(u_channel.split(".", 1)[0])
+    if n.knob("channelsX"):
+        with contextlib.suppress(Exception):
+            n["channelsX"].setValue(u_channel)
+    if n.knob("channelsY"):
+        with contextlib.suppress(Exception):
+            n["channelsY"].setValue(v_channel)
+    n.setXYpos(plate.xpos(), plate.ypos() + 60)
+    _set_name(n, name)
+    out = _node_ref(n)
+    out["u_channel"] = u_channel
+    out["v_channel"] = v_channel
+    return out
+
+
+# Active SmartVector / STMap async tasks (in addition to ``_active_renders``).
+# Same shape: keyed by task_id, value is the worker's stop event so a
+# ``cancel_render`` (or future ``cancel_task``) can short-circuit the
+# loop between frames.
+_active_distortion_tasks: dict[str, threading.Event] = {}
+_active_distortion_tasks_guard = threading.Lock()
+
+
+def _register_distortion_task(task_id: str) -> threading.Event:
+    stop = threading.Event()
+    with _active_distortion_tasks_guard:
+        _active_distortion_tasks[task_id] = stop
+    return stop
+
+
+def _unregister_distortion_task(task_id: str) -> None:
+    with _active_distortion_tasks_guard:
+        _active_distortion_tasks.pop(task_id, None)
+
+
+def _start_apply_smartvector_propagate_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the SmartVector worker."""
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("apply_smartvector_propagate_async requires task_id")
+    plate = params.get("plate")
+    if not plate:
+        raise ValueError("apply_smartvector_propagate_async requires plate")
+    paint_frame = int(params.get("paint_frame", 1))
+    range_in = int(params.get("range_in", 1))
+    range_out = int(params.get("range_out", 1))
+    name = params.get("name")
+    if range_out < range_in:
+        raise ValueError(f"range_out ({range_out}) must be >= range_in ({range_in})")
+
+    stop_event = _register_distortion_task(str(task_id))
+    thread = threading.Thread(
+        target=_smartvector_worker,
+        args=(str(task_id), plate, paint_frame, range_in, range_out, name, client, stop_event),
+        name=f"nuke-mcp-smartvector-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _smartvector_worker(
+    task_id: str,
+    plate_name: str,
+    paint_frame: int,
+    range_in: int,
+    range_out: int,
+    explicit_name: str | None,
+    client: socket.socket,
+    stop_event: threading.Event,
+) -> None:
+    """Background SmartVector propagation loop.
+
+    Creates a SmartVector node fed by the plate, sets its frame range
+    + paint frame, then iterates ``range_in..range_out`` calling
+    ``nuke.execute`` per frame on the main thread. Each frame emits a
+    ``task_progress`` notification; the final notification carries the
+    completed / cancelled / failed state.
+    """
+    import nuke
+
+    def _setup() -> tuple[Any, int, int, int]:
+        plate = nuke.toNode(plate_name)
+        if plate is None:
+            raise ValueError(f"plate node not found: {plate_name}")
+        sv_name = explicit_name or f"SmartVector_{plate_name}"
+        existing = nuke.toNode(sv_name)
+        if existing is not None and existing.Class() == "SmartVector":
+            sv = existing
+        else:
+            sv = nuke.nodes.SmartVector()
+            sv.setName(sv_name)
+            sv.setInput(0, plate)
+        if sv.knob("referenceFrame"):
+            sv["referenceFrame"].setValue(paint_frame)
+        if sv.knob("first"):
+            sv["first"].setValue(range_in)
+        if sv.knob("last"):
+            sv["last"].setValue(range_out)
+        return sv, range_in, range_out, paint_frame
+
+    def _emit(payload: dict) -> None:
+        try:
+            _send(client, payload)
+        except OSError as exc:
+            log.warning("smartvector_worker emit failed (task=%s): %s", task_id, exc)
+
+    try:
+        sv, first, last, _paint = nuke.executeInMainThreadWithResult(_setup)
+        sv_name = nuke.executeInMainThreadWithResult(sv.name)
+        total = last - first + 1
+        for offset, frame in enumerate(range(first, last + 1), start=1):
+            if stop_event.is_set():
+                _emit(
+                    {
+                        "type": "task_progress",
+                        "id": task_id,
+                        "state": "cancelled",
+                        "frame": frame - 1 if frame > first else first,
+                        "total": total,
+                    }
+                )
+                return
+            nuke.executeInMainThreadWithResult(nuke.execute, args=(sv, frame, frame))
+            _emit(
+                {
+                    "type": "task_progress",
+                    "id": task_id,
+                    "state": "working",
+                    "frame": frame,
+                    "total": total,
+                    "progress": offset,
+                }
+            )
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "completed",
+                "frame": last,
+                "total": total,
+                "result": {"smartvector": sv_name, "frames": [first, last]},
+            }
+        )
+    except Exception as e:
+        log.exception("smartvector_worker failed (task=%s)", task_id)
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "failed",
+                "error": {
+                    "error_class": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+        )
+    finally:
+        _unregister_distortion_task(task_id)
+
+
+def _start_generate_stmap_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the STMap render worker."""
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("generate_stmap_async requires task_id")
+    lens_node = params.get("lens_distortion_node")
+    if not lens_node:
+        raise ValueError("generate_stmap_async requires lens_distortion_node")
+    mode = params.get("mode", "undistort")
+    if mode not in ("undistort", "redistort"):
+        raise ValueError(f"invalid mode: {mode}")
+    name = params.get("name")
+
+    stop_event = _register_distortion_task(str(task_id))
+    thread = threading.Thread(
+        target=_generate_stmap_worker,
+        args=(str(task_id), lens_node, mode, name, client, stop_event),
+        name=f"nuke-mcp-stmap-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _generate_stmap_worker(
+    task_id: str,
+    lens_node_name: str,
+    mode: str,
+    explicit_name: str | None,
+    client: socket.socket,
+    stop_event: threading.Event,
+) -> None:
+    """Background STMap render loop.
+
+    Creates a STMapGenerator node (or falls back to LD-driven STMap if
+    that node class is unavailable in this Nuke build), set its mode,
+    and renders the script frame range. The final ``task_progress``
+    notification carries the rendered file path so the MCP-side
+    listener can store it on the Task record.
+    """
+    import nuke
+
+    def _setup() -> tuple[Any, int, int, str]:
+        lens = nuke.toNode(lens_node_name)
+        if lens is None:
+            raise ValueError(f"lens_distortion_node not found: {lens_node_name}")
+
+        # Try ``STMapGenerator`` (Nuke 13+); fall back to ``STMap`` set
+        # to ``generator`` mode on older builds. Both classes ship the
+        # same ``mode``/``file`` knob convention.
+        gen_class = "STMapGenerator"
+        gen_name = explicit_name or f"STMapGen_{lens_node_name}_{mode}"
+        existing = nuke.toNode(gen_name)
+        if existing is not None:
+            gen = existing
+        else:
+            factory = getattr(nuke.nodes, gen_class, None)
+            if factory is None:
+                factory = getattr(nuke.nodes, "STMap", None)
+                if factory is None:
+                    raise ValueError("neither STMapGenerator nor STMap node class is available")
+            gen = factory()
+            gen.setName(gen_name)
+            gen.setInput(0, lens)
+        if gen.knob("mode"):
+            with contextlib.suppress(Exception):
+                gen["mode"].setValue(mode)
+        # Resolve render frame range from script root.
+        first = int(nuke.root()["first_frame"].value())
+        last = int(nuke.root()["last_frame"].value())
+        rendered_path = ""
+        if gen.knob("file"):
+            rendered_path = gen["file"].value() or ""
+        return gen, first, last, rendered_path
+
+    def _emit(payload: dict) -> None:
+        try:
+            _send(client, payload)
+        except OSError as exc:
+            log.warning("generate_stmap_worker emit failed (task=%s): %s", task_id, exc)
+
+    try:
+        gen, first, last, rendered_path = nuke.executeInMainThreadWithResult(_setup)
+        gen_name = nuke.executeInMainThreadWithResult(gen.name)
+        total = last - first + 1
+        for offset, frame in enumerate(range(first, last + 1), start=1):
+            if stop_event.is_set():
+                _emit(
+                    {
+                        "type": "task_progress",
+                        "id": task_id,
+                        "state": "cancelled",
+                        "frame": frame - 1 if frame > first else first,
+                        "total": total,
+                    }
+                )
+                return
+            nuke.executeInMainThreadWithResult(nuke.execute, args=(gen, frame, frame))
+            _emit(
+                {
+                    "type": "task_progress",
+                    "id": task_id,
+                    "state": "working",
+                    "frame": frame,
+                    "total": total,
+                    "progress": offset,
+                }
+            )
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "completed",
+                "frame": last,
+                "total": total,
+                "result": {
+                    "stmap": gen_name,
+                    "mode": mode,
+                    "frames": [first, last],
+                    "path": rendered_path,
+                },
+            }
+        )
+    except Exception as e:
+        log.exception("generate_stmap_worker failed (task=%s)", task_id)
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "failed",
+                "error": {
+                    "error_class": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+        )
+    finally:
+        _unregister_distortion_task(task_id)
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -2306,4 +2765,19 @@ HANDLERS: dict[str, Any] = {
     "create_deep_holdout": _handle_create_deep_holdout,
     "create_deep_transform": _handle_create_deep_transform,
     "deep_to_image": _handle_deep_to_image,
+    # C4 distortion / STMap envelope
+    "bake_lens_distortion_envelope": _handle_bake_lens_distortion_envelope,
+    "apply_idistort": _handle_apply_idistort,
+}
+
+
+# Async-handler registry. Each entry maps an ``*_async`` command (sent
+# by the MCP-side ``_start_async`` helper) to a starter that records
+# the task in the appropriate active-tasks dict and spawns a worker
+# thread. Workers emit ``task_progress`` notifications on the live
+# socket and the MCP-side listener merges them into the TaskStore.
+ASYNC_HANDLERS: dict[str, Any] = {
+    "render_async": _start_render_async,
+    "apply_smartvector_propagate_async": _start_apply_smartvector_propagate_async,
+    "generate_stmap_async": _start_generate_stmap_async,
 }
