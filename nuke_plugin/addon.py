@@ -1675,6 +1675,10 @@ def _handle_setup_planar_tracker(params: dict) -> dict:
     roto = _resolve_node(plane_roto)
     if roto is None:
         raise ValueError(f"plane_roto node not found: {plane_roto}")
+    if roto.Class() not in ("Roto", "RotoPaint"):
+        raise ValueError(
+            f"plane_roto '{plane_roto}' is class '{roto.Class()}', expected Roto or RotoPaint"
+        )
 
     expected_inputs = [src.name(), roto.name()]
     cached = _maybe_existing(name, "PlanarTrackerNode", expected_inputs)
@@ -1737,6 +1741,11 @@ def _handle_bake_tracker_to_corner_pin(params: dict) -> dict:
     src = _resolve_node(tracker_name)
     if src is None:
         raise ValueError(f"tracker node not found: {tracker_name}")
+    if src.Class() not in ("Tracker4", "PlanarTrackerNode", "PlanarTracker"):
+        raise ValueError(
+            f"tracker_node '{tracker_name}' is class '{src.Class()}', "
+            "expected Tracker4 or PlanarTracker"
+        )
 
     cached = _maybe_existing(name, "CornerPin2D", [src.name()])
     if cached is not None:
@@ -1778,13 +1787,13 @@ def _handle_solve_3d_camera(params: dict) -> dict:
     # method; if missing, we hit the ``solve`` knob.
     solver = getattr(src, "solveCamera", None)
     if callable(solver):
-        with contextlib.suppress(Exception):
-            solver()
+        solver()
     else:
         knob = src.knob("solve")
         if knob is not None:
-            with contextlib.suppress(Exception):
-                knob.execute()
+            knob.execute()
+        else:
+            raise ValueError("CameraTracker has no solveCamera method or solve knob")
 
     if name and name != src.name():
         src.setName(name)

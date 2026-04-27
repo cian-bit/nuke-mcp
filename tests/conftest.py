@@ -1580,6 +1580,11 @@ class MockNukeServer:
             raise ValueError(f"node not found: {input_node}")
         if plane_roto not in self.nodes:
             raise ValueError(f"plane_roto node not found: {plane_roto}")
+        plane_type = self.nodes[plane_roto]["type"]
+        if plane_type not in ("Roto", "RotoPaint"):
+            raise ValueError(
+                f"plane_roto '{plane_roto}' is class '{plane_type}', expected Roto or RotoPaint"
+            )
         expected_inputs = [input_node, plane_roto]
         cached = self._try_idempotent(name, "PlanarTrackerNode", expected_inputs)
         if cached is not None:
@@ -1622,6 +1627,12 @@ class MockNukeServer:
         name = p.get("name")
         if tracker_node not in self.nodes:
             raise ValueError(f"tracker node not found: {tracker_node}")
+        tracker_type = self.nodes[tracker_node]["type"]
+        if tracker_type not in ("Tracker4", "PlanarTrackerNode", "PlanarTracker"):
+            raise ValueError(
+                f"tracker_node '{tracker_node}' is class '{tracker_type}', "
+                "expected Tracker4 or PlanarTracker"
+            )
         expected_inputs = [tracker_node]
         cached = self._try_idempotent(name, "CornerPin2D", expected_inputs)
         if cached is not None:

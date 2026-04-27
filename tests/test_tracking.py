@@ -203,6 +203,15 @@ def test_setup_planar_tracker_missing_input(tracking_tools):
     assert result.get("status") == "error"
 
 
+def test_setup_planar_tracker_rejects_non_roto_plane(tracking_tools):
+    server, _script, tools = tracking_tools
+    server.nodes["not_roto"] = {"type": "Card3D", "knobs": {}, "x": 0, "y": 0}
+    server.connections["not_roto"] = []
+    result = tools["setup_planar_tracker"]("plate", "not_roto")
+    assert result.get("status") == "error"
+    assert "expected Roto" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # setup_tracker4
 # ---------------------------------------------------------------------------
@@ -258,6 +267,13 @@ def test_bake_tracker_to_corner_pin_unknown_tracker(tracking_tools):
     _server, _script, tools = tracking_tools
     result = tools["bake_tracker_to_corner_pin"]("not_real")
     assert result.get("status") == "error"
+
+
+def test_bake_tracker_to_corner_pin_rejects_non_tracker(tracking_tools):
+    _server, _script, tools = tracking_tools
+    result = tools["bake_tracker_to_corner_pin"]("plate")
+    assert result.get("status") == "error"
+    assert "expected Tracker4" in result["error"]
 
 
 # ---------------------------------------------------------------------------
