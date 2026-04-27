@@ -14,6 +14,7 @@ import functools
 import json
 import logging
 import os
+import pathlib
 import random
 import socket
 import threading
@@ -66,6 +67,13 @@ _last_host: str | None = None
 _last_port: int | None = None
 _io_lock = threading.Lock()
 _session_lost = False
+
+# A5: crash-marker recovery. ``connect()`` reads ~/.nuke_mcp/crash_marker.json
+# (or whatever ``NUKE_MCP_MARKER_DIR`` overrides to, kept in sync with the
+# watchdog on the addon side) and stashes a warning here. The first
+# subsequent ``send()`` merges it into the result and clears the field.
+_pending_warning: dict[str, Any] | None = None
+_CRASH_MARKER_MAX_AGE_S = 3600.0  # 1 hour
 
 # Heartbeat state. Started in connect(), torn down in disconnect().
 _heartbeat_thread: threading.Thread | None = None
@@ -217,6 +225,58 @@ def _do_connect(host: str, port: int) -> tuple[socket.socket, NukeVersion]:
     return s, version
 
 
+def _crash_marker_path() -> pathlib.Path:
+    """Resolve the watchdog crash-marker path.
+
+    Mirrors ``nuke_plugin/_watchdog.py:marker_path``. Kept in sync by hand
+    rather than imported because connection.py is the MCP-side module and
+    the watchdog lives on the Nuke-addon side -- they're packaged as
+    separate trees.
+    """
+    override = os.environ.get("NUKE_MCP_MARKER_DIR")
+    base = pathlib.Path(override) if override else pathlib.Path.home() / ".nuke_mcp"
+    return base / "crash_marker.json"
+
+
+def _consume_crash_marker() -> None:
+    """If a fresh crash marker exists, stash ``_pending_warning`` and delete it.
+
+    Stale markers (mtime older than ``_CRASH_MARKER_MAX_AGE_S``) are
+    deleted without producing a warning -- the implication is that the
+    user already noticed Nuke went down hours ago and there's no
+    actionable recovery context to surface.
+    """
+    global _pending_warning
+    path = _crash_marker_path()
+    try:
+        st = path.stat()
+    except (OSError, ValueError):
+        return
+
+    age = time.time() - st.st_mtime
+    if age > _CRASH_MARKER_MAX_AGE_S:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return
+
+    minutes = max(1, int(age // 60))
+    last_tool = data.get("last_tool") or "unknown"
+    last_rid = data.get("last_request_id")
+    _pending_warning = {
+        "warning": f"session lost ~{minutes}m ago, last op was {last_tool}",
+        "last_request_id": last_rid,
+    }
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
 def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
     """Connect to Nuke addon. Returns version info from handshake."""
     global _sock, _nuke_version, _last_host, _last_port, _session_lost
@@ -231,6 +291,8 @@ def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
     _last_port = port
     _session_lost = False
     log.info("connected to %s on %s:%d", version, host, port)
+
+    _consume_crash_marker()
 
     if _heartbeat_enabled():
         _start_heartbeat()
@@ -389,7 +451,29 @@ def send(command: str, *, _class: str = "read", **params: Any) -> dict[str, Any]
         }
         raise CommandError(resp.get("error", "unknown error"), envelope=envelope)
 
-    return resp.get("result", {})
+    result = resp.get("result", {})
+    return _consume_pending_warning(result)
+
+
+def _consume_pending_warning(result: Any) -> Any:
+    """Merge any stashed crash-recovery warning into ``result`` once.
+
+    Only merges when ``result`` is a dict (which is the convention for
+    every typed handler). For non-dict results we drop the warning
+    silently rather than reshape the response -- the warning is best-
+    effort context, not load-bearing data.
+    """
+    global _pending_warning
+    if _pending_warning is None:
+        return result
+    pending = _pending_warning
+    _pending_warning = None
+    if isinstance(result, dict):
+        merged = dict(result)
+        for key, value in pending.items():
+            merged.setdefault(key, value)
+        return merged
+    return result
 
 
 def send_class(command: str, _class: str, **params: Any) -> dict[str, Any]:
