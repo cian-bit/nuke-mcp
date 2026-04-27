@@ -27,6 +27,7 @@ from nuke_mcp.models import (
     RenderResult,
     ScriptInfo,
 )
+from nuke_mcp.models._warnings import reset_for_tests
 
 # ---------------------------------------------------------------------------
 # NodeInfo
@@ -221,3 +222,27 @@ def test_read_node_detail_wire_shape_unchanged(connected) -> None:  # type: igno
     assert result["type"] == "Grade"
     # Knob value flows through the model.
     assert result["knobs"]["mix"] == 0.5
+
+
+def test_read_comp_model_validation_warning_once(monkeypatch, caplog) -> None:
+    """Malformed addon payloads remain best-effort but are logged."""
+    from nuke_mcp.tools import read
+
+    reset_for_tests()
+    monkeypatch.setattr(
+        connection,
+        "send",
+        lambda *_args, **_kwargs: {"nodes": [{"type": "Grade"}], "count": 1},
+    )
+    ctx = _StubCtx()
+    read.register(ctx)
+
+    first = ctx.mcp.registered["read_comp"]()
+    second = ctx.mcp.registered["read_comp"]()
+
+    assert first["nodes"] == [{"type": "Grade"}]
+    assert second["nodes"] == [{"type": "Grade"}]
+    warnings = [
+        record for record in caplog.records if "NodeInfo validation failed" in record.getMessage()
+    ]
+    assert len(warnings) == 1

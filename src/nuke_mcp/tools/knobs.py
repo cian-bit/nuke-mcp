@@ -10,7 +10,7 @@ sink the call.
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
@@ -18,10 +18,13 @@ from pydantic import TypeAdapter, ValidationError
 from nuke_mcp import connection
 from nuke_mcp.annotations import IDEMPOTENT, READ_ONLY
 from nuke_mcp.models import KnobValue
+from nuke_mcp.models._warnings import warn_once
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
     from nuke_mcp.server import ServerContext
+
+log = logging.getLogger(__name__)
 
 
 # TypeAdapter is the v2 way to validate a non-BaseModel union. Built
@@ -44,8 +47,15 @@ def _coerce_knob_value(payload: dict[str, Any]) -> dict[str, Any]:
         raw = list(raw)
     # Defensive: keep the original value rather than fail closed if a
     # quirky knob type slips past the union.
-    with contextlib.suppress(ValidationError):
+    try:
         payload["value"] = _KNOB_VALUE_ADAPTER.validate_python(raw)
+    except ValidationError as exc:
+        warn_once(
+            log,
+            "knob_value",
+            "knob value validation failed; returning raw value: %s",
+            exc,
+        )
     return payload
 
 
