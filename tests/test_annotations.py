@@ -104,6 +104,12 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "bake_tracker_to_corner_pin": BENIGN_NEW,
     "solve_3d_camera": BENIGN_NEW,
     "bake_camera_to_card": BENIGN_NEW,
+    # deep.py (C1)
+    "create_deep_recolor": BENIGN_NEW,
+    "create_deep_merge": BENIGN_NEW,
+    "create_deep_holdout": BENIGN_NEW,
+    "create_deep_transform": BENIGN_NEW,
+    "deep_to_image": BENIGN_NEW,
 }
 
 

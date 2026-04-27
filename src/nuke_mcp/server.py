@@ -12,6 +12,7 @@ from nuke_mcp.tools import (
     channels,
     code,
     comp,
+    deep,
     digest,
     expressions,
     graph,
@@ -75,6 +76,7 @@ def build_server(mock: bool = False) -> FastMCP:
     roto.register(ctx)
     digest.register(ctx)
     tracking.register(ctx)
+    deep.register(ctx)
 
     return mcp
 
