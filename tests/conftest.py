@@ -828,6 +828,28 @@ class MockNukeServer:
             "colorspace": "ACES",
             "node_count": 0,
         }
+        # C2 color management: root knobs that ``get_color_management``
+        # reads + ``set_working_space`` writes. Tests can mutate this
+        # dict directly to set up specific OCIO scenarios. The
+        # ``working_space_values`` list backs the enumeration check on
+        # ``set_working_space``; an empty list disables the check
+        # (matches addon behaviour with String_Knob configs).
+        self.color_management: dict[str, str] = {
+            "color_management": "OCIO",
+            "ocio_config": "aces_1.3",
+            "working_space": "ACES - ACEScg",
+            "default_view": "ACES/sRGB",
+            "monitor_lut": "sRGB",
+        }
+        self.working_space_values: list[str] = [
+            "ACES - ACEScg",
+            "ACES - ACEScct",
+            "ACES - ACES2065-1",
+            "Output - sRGB",
+            "Utility - Linear - sRGB",
+            "Utility - sRGB - Texture",
+            "scene_linear",
+        ]
         # Optional MockNukeNode-backed registry. Default-empty; tests opt in
         # via the ``mock_script`` fixture which attaches one.
         self.script: MockNukeScript | None = None
@@ -947,6 +969,12 @@ class MockNukeServer:
             "create_deep_holdout": self._create_deep_holdout,
             "create_deep_transform": self._create_deep_transform,
             "deep_to_image": self._deep_to_image,
+            # C2 color management
+            "get_color_management": self._get_color_management,
+            "set_working_space": self._set_working_space,
+            "audit_acescct_consistency": self._audit_acescct_consistency,
+            "convert_node_colorspace": self._convert_node_colorspace,
+            "create_ocio_colorspace": self._create_ocio_colorspace,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -1811,6 +1839,217 @@ class MockNukeServer:
             name,
             "DeepToImage1",
             expected_inputs,
+        )
+        return self._node_ref_from_state(new_name)
+
+    # ---------- C2: color management ----------
+
+    _NONLINEAR_EXTS = (".png", ".jpg", ".jpeg")
+    _SRGB_HINT = "_srgb"
+
+    def _get_color_management(self, p: dict) -> dict:
+        self.typed_calls.append(("get_color_management", dict(p)))
+        return dict(self.color_management)
+
+    def _set_working_space(self, p: dict) -> dict:
+        self.typed_calls.append(("set_working_space", dict(p)))
+        space = p["space"]
+        if self.working_space_values and space not in self.working_space_values:
+            raise ValueError(
+                f"invalid working space {space!r}; "
+                f"allowed: {sorted(self.working_space_values)[:10]}"
+            )
+        self.color_management["working_space"] = space
+        return {"working_space": space}
+
+    def _audit_acescct_consistency(self, p: dict) -> dict:
+        """Mock heuristics matching the addon shape.
+
+        Walks ``self.nodes`` and applies the same three rules as
+        ``_handle_audit_acescct_consistency``. Reads/Writes/Grades only;
+        every other class is skipped.
+        """
+        self.typed_calls.append(("audit_acescct_consistency", dict(p)))
+        strict = bool(p.get("strict", True))
+        working = self.color_management.get("working_space", "")
+        is_acescg = "ACEScg" in working
+
+        findings: list[dict[str, str]] = []
+        for nname, node in self.nodes.items():
+            cls = node.get("type")
+            knobs = node.get("knobs", {})
+
+            if cls == "Read":
+                cspace = str(knobs.get("colorspace", ""))
+                path = str(knobs.get("file", ""))
+                lowered = path.lower()
+                looks_nonlinear = self._SRGB_HINT in lowered or lowered.endswith(
+                    self._NONLINEAR_EXTS
+                )
+                if cspace.startswith("default") and looks_nonlinear:
+                    findings.append(
+                        {
+                            "severity": "warning",
+                            "node": nname,
+                            "message": (
+                                f"Read '{nname}' colorspace=default but path "
+                                f"'{path}' looks non-linear (sRGB/PNG/JPG)."
+                            ),
+                            "fix_suggestion": (
+                                "Set the Read 'colorspace' knob to "
+                                "'sRGB - Texture' (or your config's "
+                                "equivalent) instead of leaving it at default."
+                            ),
+                        }
+                    )
+
+            elif cls == "Grade" and is_acescg:
+                # Walk upstream looking for an OCIOColorSpace with
+                # out_colorspace containing ACEScct.
+                seen: set[str] = set()
+                frontier = list(self.connections.get(nname, []))
+                found_acescct = False
+                depth = 0
+                while frontier and depth < 12 and not found_acescct:
+                    next_frontier: list[str] = []
+                    for upname in frontier:
+                        if upname is None or upname in seen:
+                            continue
+                        seen.add(upname)
+                        upnode = self.nodes.get(upname)
+                        if upnode is None:
+                            continue
+                        if upnode.get("type") == "OCIOColorSpace":
+                            out_cs = str(upnode.get("knobs", {}).get("out_colorspace", ""))
+                            if "ACEScct" in out_cs:
+                                found_acescct = True
+                                break
+                        next_frontier.extend(self.connections.get(upname, []))
+                    frontier = next_frontier
+                    depth += 1
+                if not found_acescct:
+                    findings.append(
+                        {
+                            "severity": "warning" if strict else "info",
+                            "node": nname,
+                            "message": (
+                                f"Grade '{nname}' is downstream of an ACEScg "
+                                f"working space but no upstream OCIOColorSpace "
+                                f"converts to ACEScct."
+                            ),
+                            "fix_suggestion": (
+                                "Insert an OCIOColorSpace ACEScg -> ACEScct "
+                                "before the Grade and a matching ACEScct -> "
+                                "ACEScg after it."
+                            ),
+                        }
+                    )
+
+            elif cls == "Write":
+                cspace = str(knobs.get("colorspace", ""))
+                path = str(knobs.get("file", ""))
+                lowered_path = path.lower()
+                is_linear_delivery = lowered_path.endswith((".exr", ".dpx", ".tif", ".tiff"))
+                looks_srgb = "srgb" in cspace.lower() or cspace.lower() == "rec.709"
+                if is_linear_delivery and looks_srgb:
+                    findings.append(
+                        {
+                            "severity": "error",
+                            "node": nname,
+                            "message": (
+                                f"Write '{nname}' delivers '{path}' as "
+                                f"colorspace='{cspace}' -- "
+                                f"scene-linear formats expect a linear / "
+                                f"working-space tag."
+                            ),
+                            "fix_suggestion": (
+                                "Set the Write 'colorspace' knob to the "
+                                "scene-linear delivery target (typically "
+                                "'ACES - ACEScg' or 'scene_linear')."
+                            ),
+                        }
+                    )
+        return {"findings": findings}
+
+    def _convert_node_colorspace(self, p: dict) -> dict:
+        self.typed_calls.append(("convert_node_colorspace", dict(p)))
+        target = p["node"]
+        in_cs = p["in_cs"]
+        out_cs = p["out_cs"]
+        if target not in self.nodes:
+            raise ValueError(f"node not found: {target}")
+
+        # Snapshot consumers (anything with target in its inputs) BEFORE
+        # creating the trailing converter so we don't self-rewire.
+        consumers: list[tuple[str, int]] = []
+        for nname, ins in self.connections.items():
+            if nname == target:
+                continue
+            for i, src in enumerate(ins):
+                if src == target:
+                    consumers.append((nname, i))
+
+        # Detach target's input 0 and route via leading converter.
+        target_inputs = self.connections.get(target, [])
+        upstream = target_inputs[0] if target_inputs else None
+
+        leading_name = self._next_unique_name("OCIOColorSpace1")
+        self.nodes[leading_name] = {
+            "type": "OCIOColorSpace",
+            "knobs": {"in_colorspace": in_cs, "out_colorspace": out_cs},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[leading_name] = [upstream] if upstream else []
+
+        # Re-wire target's input 0 to leading.
+        new_inputs = list(target_inputs) if target_inputs else []
+        if not new_inputs:
+            new_inputs = [leading_name]
+        else:
+            new_inputs[0] = leading_name
+        self.connections[target] = new_inputs
+
+        trailing_name = self._next_unique_name("OCIOColorSpace1")
+        self.nodes[trailing_name] = {
+            "type": "OCIOColorSpace",
+            "knobs": {"in_colorspace": out_cs, "out_colorspace": in_cs},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[trailing_name] = [target]
+
+        # Re-wire snapshotted consumers to feed from trailing.
+        for cname, slot in consumers:
+            cins = list(self.connections.get(cname, []))
+            if slot < len(cins):
+                cins[slot] = trailing_name
+            self.connections[cname] = cins
+
+        return {
+            "leading": self._node_ref_from_state(leading_name),
+            "trailing": self._node_ref_from_state(trailing_name),
+            "wrapped": target,
+        }
+
+    def _create_ocio_colorspace(self, p: dict) -> dict:
+        self.typed_calls.append(("create_ocio_colorspace", dict(p)))
+        input_node = p["input_node"]
+        in_cs = p["in_cs"]
+        out_cs = p["out_cs"]
+        name = p.get("name")
+        if input_node not in self.nodes:
+            raise ValueError(f"input_node not found: {input_node}")
+        expected_inputs = [input_node]
+        cached = self._try_idempotent(name, "OCIOColorSpace", expected_inputs)
+        if cached is not None:
+            return cached
+        new_name = self._register_node(
+            "OCIOColorSpace",
+            name,
+            "OCIOColorSpace1",
+            expected_inputs,
+            knobs={"in_colorspace": in_cs, "out_colorspace": out_cs},
         )
         return self._node_ref_from_state(new_name)
 
