@@ -84,6 +84,12 @@ PROFILES: dict[str, list[str]] = {
         "list_profiles",
         "load_profile",
         "unload_profile",
+        # tasks.py (B2 Tasks primitive — the meta tools for inspecting
+        # async work always live in core so model can navigate them)
+        "tasks_list",
+        "tasks_get",
+        "tasks_cancel",
+        "tasks_resume",
     ],
     # Graph-advanced: bulk-mutation + escape-hatch + selection-driven
     # reads. Heavier-weight surfaces that a typical comp-read session

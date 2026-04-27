@@ -32,6 +32,7 @@ from nuke_mcp.tools import (
     render,
     roto,
     script,
+    tasks,
     tracking,
     viewer,
 )
@@ -87,6 +88,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     digest.register(ctx)
     tracking.register(ctx)
     deep.register(ctx)
+    tasks.register(ctx)
     profiles_tools.register(ctx)
 
     # Diff: every tool listed in PROFILES that isn't part of an active

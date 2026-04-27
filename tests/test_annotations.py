@@ -116,6 +116,11 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "list_profiles": READ_ONLY,
     "load_profile": BENIGN_NEW,
     "unload_profile": BENIGN_NEW,
+    # tasks.py (B2 -- MCP 2025-11-25 Tasks primitive)
+    "tasks_list": READ_ONLY,
+    "tasks_get": READ_ONLY,
+    "tasks_cancel": DESTRUCTIVE,
+    "tasks_resume": READ_ONLY,
 }
 
 
