@@ -480,7 +480,7 @@ class MockNukeNode:
             "referenceFrame": MockKnob("referenceFrame", value=1001),
             "rootWarp": MockEnumKnob("rootWarp", value="perspective"),
         }
-        return cls(name=name, node_class="PlanarTrackerNode", knobs=knobs, xpos=xpos, ypos=ypos)
+        return cls(name=name, node_class="PlanarTracker", knobs=knobs, xpos=xpos, ypos=ypos)
 
     @classmethod
     def shuffle(cls, name: str = "Shuffle1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
@@ -526,7 +526,7 @@ class MockNukeNode:
     @classmethod
     def deepholdout(cls, name: str = "DeepHoldout1", xpos: int = 0, ypos: int = 0) -> MockNukeNode:
         knobs: dict[str, MockKnob] = {}
-        node = cls(name=name, node_class="DeepHoldout", knobs=knobs, xpos=xpos, ypos=ypos)
+        node = cls(name=name, node_class="DeepHoldout2", knobs=knobs, xpos=xpos, ypos=ypos)
         node._inputs = [None, None]
         return node
 
@@ -1586,11 +1586,11 @@ class MockNukeServer:
                 f"plane_roto '{plane_roto}' is class '{plane_type}', expected Roto or RotoPaint"
             )
         expected_inputs = [input_node, plane_roto]
-        cached = self._try_idempotent(name, "PlanarTrackerNode", expected_inputs)
+        cached = self._try_idempotent(name, "PlanarTracker", expected_inputs)
         if cached is not None:
             return cached
         new_name = self._register_node(
-            "PlanarTrackerNode",
+            "PlanarTracker",
             name,
             "PlanarTracker1",
             expected_inputs,
@@ -1628,7 +1628,7 @@ class MockNukeServer:
         if tracker_node not in self.nodes:
             raise ValueError(f"tracker node not found: {tracker_node}")
         tracker_type = self.nodes[tracker_node]["type"]
-        if tracker_type not in ("Tracker4", "PlanarTrackerNode", "PlanarTracker"):
+        if tracker_type not in ("Tracker4", "PlanarTracker", "PlanarTracker"):
             raise ValueError(
                 f"tracker_node '{tracker_node}' is class '{tracker_type}', "
                 "expected Tracker4 or PlanarTracker"
@@ -1744,11 +1744,11 @@ class MockNukeServer:
         if holdout_node not in self.nodes:
             raise ValueError(f"holdout_node not found: {holdout_node}")
         expected_inputs = [subject_node, holdout_node]
-        cached = self._try_idempotent(name, "DeepHoldout", expected_inputs)
+        cached = self._try_idempotent(name, "DeepHoldout2", expected_inputs)
         if cached is not None:
             return cached
         new_name = self._register_node(
-            "DeepHoldout",
+            "DeepHoldout2",
             name,
             "DeepHoldout1",
             expected_inputs,

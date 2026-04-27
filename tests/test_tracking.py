@@ -180,7 +180,7 @@ def test_setup_camera_tracker_rejects_bad_solve_method(tracking_tools):
 def test_setup_planar_tracker_happy_path(tracking_tools):
     server, _script, tools = tracking_tools
     result = tools["setup_planar_tracker"]("plate", "plane_roto")
-    assert result["type"] == "PlanarTrackerNode"
+    assert result["type"] == "PlanarTracker"
     assert result["inputs"][:2] == ["plate", "plane_roto"]
     _cmd, params = server.typed_calls[0]
     assert params["input_node"] == "plate"
@@ -193,7 +193,7 @@ def test_setup_planar_tracker_idempotent(tracking_tools):
     first = tools["setup_planar_tracker"]("plate", "plane_roto", name="myPlanar")
     second = tools["setup_planar_tracker"]("plate", "plane_roto", name="myPlanar")
     assert first["name"] == second["name"] == "myPlanar"
-    planar_count = [n for n, d in server.nodes.items() if d["type"] == "PlanarTrackerNode"]
+    planar_count = [n for n, d in server.nodes.items() if d["type"] == "PlanarTracker"]
     assert len(planar_count) == 1
 
 

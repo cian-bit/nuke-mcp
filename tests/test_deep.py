@@ -195,7 +195,7 @@ def test_create_deep_merge_unknown_input(deep_tools):
 def test_create_deep_holdout_happy_path(deep_tools):
     server, _script, tools = deep_tools
     result = tools["create_deep_holdout"]("deepA", "holdoutDeep")
-    assert result["type"] == "DeepHoldout"
+    assert result["type"] == "DeepHoldout2"
     assert result["inputs"][:2] == ["deepA", "holdoutDeep"]
     cmd, params = server.typed_calls[0]
     assert cmd == "create_deep_holdout"
@@ -208,7 +208,7 @@ def test_create_deep_holdout_idempotent(deep_tools):
     first = tools["create_deep_holdout"]("deepA", "holdoutDeep", name="myHoldout")
     second = tools["create_deep_holdout"]("deepA", "holdoutDeep", name="myHoldout")
     assert first["name"] == second["name"] == "myHoldout"
-    nodes = [n for n, d in server.nodes.items() if d["type"] == "DeepHoldout"]
+    nodes = [n for n, d in server.nodes.items() if d["type"] == "DeepHoldout2"]
     assert len(nodes) == 1
 
 

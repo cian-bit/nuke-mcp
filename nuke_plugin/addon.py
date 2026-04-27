@@ -1681,18 +1681,29 @@ def _handle_setup_planar_tracker(params: dict) -> dict:
         )
 
     expected_inputs = [src.name(), roto.name()]
-    cached = _maybe_existing(name, "PlanarTrackerNode", expected_inputs)
+    # Try PlanarTracker (Nuke 15.x verified) first, then legacy
+    # PlanarTrackerNode. ``nuke.nodes.X`` always returns a callable
+    # factory, so the *creation* call is what reveals the real class.
+    cached = _maybe_existing(name, "PlanarTracker", expected_inputs)
     if cached is not None:
         return cached
 
-    # Try the modern class first (PlanarTrackerNode), fall back to the
-    # legacy gizmo name if the bind fails.
-    factory = getattr(nuke.nodes, "PlanarTrackerNode", None)
-    if factory is None:
-        factory = getattr(nuke.nodes, "PlanarTracker", None)
-    if factory is None:
-        raise ValueError("PlanarTrackerNode not available in this Nuke build")
-    tracker = factory()
+    tracker = None
+    create_errors = []
+    for class_name in ("PlanarTracker", "PlanarTrackerNode"):
+        factory = getattr(nuke.nodes, class_name, None)
+        if factory is None:
+            create_errors.append(f"{class_name}: factory missing")
+            continue
+        try:
+            tracker = factory()
+            break
+        except (RuntimeError, Exception) as exc:
+            create_errors.append(f"{class_name}: {exc}")
+    if tracker is None:
+        raise ValueError(
+            "PlanarTracker not available in this Nuke build: " + "; ".join(create_errors)
+        )
     tracker.setInput(0, src)
     tracker.setInput(1, roto)
     if tracker.knob("referenceFrame"):
@@ -1783,17 +1794,24 @@ def _handle_solve_3d_camera(params: dict) -> dict:
     if name and name == src.name():
         return _node_ref(src)
 
-    # Trigger the solve. CameraTracker::solveCamera is the canonical
-    # method; if missing, we hit the ``solve`` knob.
-    solver = getattr(src, "solveCamera", None)
-    if callable(solver):
-        solver()
+    # Trigger the solve. In Nuke 15.x ``solveCamera`` is a button knob
+    # on the CameraTracker (not a method on the PyNode). Older builds
+    # exposed a method by the same name, and some had a ``solve`` knob.
+    # Try button-knob path first (the verified Nuke 15.1 shape), then
+    # method, then legacy ``solve`` knob.
+    solve_knob = src.knob("solveCamera")
+    if solve_knob is not None and hasattr(solve_knob, "execute"):
+        solve_knob.execute()
     else:
-        knob = src.knob("solve")
-        if knob is not None:
-            knob.execute()
+        solver = getattr(src, "solveCamera", None)
+        if callable(solver):
+            solver()
         else:
-            raise ValueError("CameraTracker has no solveCamera method or solve knob")
+            legacy = src.knob("solve")
+            if legacy is not None and hasattr(legacy, "execute"):
+                legacy.execute()
+            else:
+                raise ValueError("CameraTracker has no solveCamera knob/method or solve knob")
 
     if name and name != src.name():
         src.setName(name)
@@ -1914,13 +1932,35 @@ def _handle_create_deep_holdout(params: dict) -> dict:
         raise ValueError(f"holdout_node not found: {holdout_name}")
 
     expected_inputs = [subject.name(), holdout.name()]
-    cached = _maybe_existing(name, "DeepHoldout", expected_inputs)
+    # DeepHoldout2 is the modern 2-input version (Nuke 15+); legacy
+    # DeepHoldout takes a single input. Try the 2-input shape first
+    # then fall back. Match cache against the actual class created.
+    cached = _maybe_existing(name, "DeepHoldout2", expected_inputs) or _maybe_existing(
+        name, "DeepHoldout", expected_inputs
+    )
     if cached is not None:
         return cached
 
-    hd = nuke.nodes.DeepHoldout()
-    hd.setInput(0, subject)
-    hd.setInput(1, holdout)
+    hd = None
+    create_errors = []
+    for class_name in ("DeepHoldout2", "DeepHoldout"):
+        factory = getattr(nuke.nodes, class_name, None)
+        if factory is None:
+            create_errors.append(f"{class_name}: factory missing")
+            continue
+        try:
+            candidate = factory()
+            # Verify it accepts the second input -- legacy DeepHoldout
+            # is single-input and ``setInput(1, ...)`` returns False.
+            if candidate.setInput(1, holdout):
+                candidate.setInput(0, subject)
+                hd = candidate
+                break
+            create_errors.append(f"{class_name}: refused holdout input")
+        except (RuntimeError, Exception) as exc:
+            create_errors.append(f"{class_name}: {exc}")
+    if hd is None:
+        raise ValueError("Could not create DeepHoldout: " + "; ".join(create_errors))
     hd.setXYpos(
         (subject.xpos() + holdout.xpos()) // 2,
         max(subject.ypos(), holdout.ypos()) + 80,
