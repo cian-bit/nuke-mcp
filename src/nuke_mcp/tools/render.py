@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
+from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -10,7 +12,7 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=BENIGN_NEW, output_schema=None)
     @nuke_command("setup_write")
     def setup_write(
         input_node: str,
@@ -20,29 +22,29 @@ def register(ctx: ServerContext) -> None:
     ) -> dict:
         """Create a Write node connected to input_node with production defaults.
 
+        A3: typed dispatch -- the addon validates ``file_type`` against
+        the allowlist (exr/tiff/png/jpeg/mov/dpx) and rejects any path
+        with a ``..`` traversal component.
+
         Args:
             input_node: node to connect as input.
             path: output file path (use #### for frame padding).
-            file_type: exr, png, jpg, dpx, etc.
+            file_type: exr, tiff, png, jpeg, mov, or dpx.
             colorspace: output colorspace.
         """
-        code = f"""
-import nuke
-src = nuke.toNode({input_node!r})
-if not src:
-    raise ValueError("node not found: {input_node}")
-w = nuke.nodes.Write()
-w.setInput(0, src)
-w["file"].setValue({path!r})
-w["file_type"].setValue({file_type!r})
-if w.knob("colorspace"):
-    w["colorspace"].setValue({colorspace!r})
-__result__ = {{"name": w.name(), "path": {path!r}}}
-"""
-        return connection.send("execute_python", code=code)
+        return run_on_main(
+            "setup_write",
+            {
+                "input_node": input_node,
+                "path": path,
+                "file_type": file_type,
+                "colorspace": colorspace,
+            },
+            "mutate",
+        )
 
     @ctx.mcp.tool(
-        annotations={"destructiveHint": True},
+        annotations=DESTRUCTIVE | OPEN_WORLD,
         output_schema=None,
     )
     @nuke_command("render_frames")
@@ -73,9 +75,14 @@ __result__ = {{"name": w.name(), "path": {path!r}}}
             params["write_node"] = write_node
         if first_frame is not None and last_frame is not None:
             params["frame_range"] = [first_frame, last_frame]
-        return connection.send_raw("render", timeout=300.0, **params)
+        # render = non-idempotent (writes frames). 900s class timeout
+        # via TIMEOUT_CLASSES["render"] -- removes the prior 300s magic
+        # number and routes the call through the same envelope as send().
+        return connection.send("render", _class="render", **params)
 
-    @ctx.mcp.tool(output_schema=None)
+    # ``setup_precomp`` creates new Read+Write nodes -- not idempotent. Stamp
+    # ``destructiveHint=False`` so the schema explicitly marks it benign.
+    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
     @nuke_command("setup_precomp")
     def setup_precomp(
         source_node: str,
@@ -155,7 +162,7 @@ __result__ = {{
         return connection.send("execute_python", code=code)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("list_precomps")

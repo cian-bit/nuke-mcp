@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -10,7 +11,8 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(output_schema=None)
+    # ``create_roto`` makes a new Roto/RotoPaint each call. Not idempotent.
+    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
     @nuke_command("create_roto")
     def create_roto(input_node: str, roto_type: str = "Roto") -> dict:
         """Create a Roto or RotoPaint node connected to the input.
@@ -32,7 +34,7 @@ __result__ = {{"name": r.name(), "type": r.Class()}}
         return connection.send("execute_python", code=code)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("list_roto_shapes")

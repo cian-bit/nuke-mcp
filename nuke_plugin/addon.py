@@ -55,11 +55,42 @@ def is_running() -> bool:
     return _running
 
 
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive with aggressive per-OS tuning.
+
+    Layered cross-platform: every socket gets SO_KEEPALIVE; per-OS
+    tunings are wrapped in try/except so a missing constant on one
+    platform doesn't break the others. Surfaces a torn TCP stream
+    within a few seconds of a Nuke crash instead of waiting for the
+    next handler call to time out.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError):
+        return
+
+    # Linux
+    with contextlib.suppress(OSError, AttributeError):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 1)  # type: ignore[attr-defined]
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)  # type: ignore[attr-defined]
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)  # type: ignore[attr-defined]
+
+    # Windows
+    with contextlib.suppress(OSError, AttributeError):
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 1000, 1000))  # type: ignore[attr-defined]
+
+    # macOS
+    with contextlib.suppress(OSError, AttributeError):
+        tcp_keepalive = getattr(socket, "TCP_KEEPALIVE", 0x10)
+        sock.setsockopt(socket.IPPROTO_TCP, tcp_keepalive, 1)
+
+
 def _server_loop(port: int) -> None:
     global _server_socket
     try:
         _server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _enable_keepalive(_server_socket)
         _server_socket.bind(("127.0.0.1", port))
         _server_socket.listen(1)
         _server_socket.settimeout(1.0)
@@ -72,6 +103,7 @@ def _server_loop(port: int) -> None:
             except OSError:
                 break
 
+            _enable_keepalive(client)
             log.info("client connected from %s", addr)
             _handle_client(client)
             log.info("client disconnected")
@@ -135,30 +167,82 @@ def _handle_client(client: socket.socket) -> None:
             break
 
 
+# B7: per-request node-name -> nuke.Node cache. Stashed on threading.local
+# so handlers can call _resolve_node(name) without each one paying its own
+# nuke.toNode() lookup. _dispatch resets the cache for every request, so
+# a stale cache can't leak across calls.
+_request_local = threading.local()
+
+
+def _resolve_node(name: str) -> Any:
+    """Look up ``name`` via the per-request cache, falling back to ``nuke.toNode``.
+
+    Cache is set up by ``_dispatch`` for the duration of a single request.
+    If no cache is active (e.g. handler called directly from a test), this
+    falls through to ``nuke.toNode`` with no caching.
+    """
+    import nuke
+
+    cache: dict[str, Any] | None = getattr(_request_local, "node_cache", None)
+    if cache is None:
+        return nuke.toNode(name)
+    if name in cache:
+        return cache[name]
+    node = nuke.toNode(name)
+    cache[name] = node
+    return node
+
+
 def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
-    """Route a command to the right handler, executed on Nuke's main thread."""
+    """Route a command to the right handler, executed on Nuke's main thread.
+
+    A2: echoes ``_request_id`` from the top-level payload back in the
+    response so the MCP-side ``send()`` can assert round-trip identity.
+    The id lives at the payload root, not inside ``params``.
+
+    B7: installs a fresh per-request ``node_cache`` on ``_request_local``
+    so handlers that touch the same node twice (or that participate in
+    batch operations) avoid redundant ``nuke.toNode`` calls.
+    """
     import nuke
 
     cmd = msg.get("type", "")
     params = msg.get("params", {})
+    rid = msg.get("_request_id")
 
     if cmd == "ping":
-        return {"status": "ok", "result": {"pong": True}}
+        resp = {"status": "ok", "result": {"pong": True}}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
     # build the code string to execute on the main thread
     handler = HANDLERS.get(cmd)
     if handler is None:
-        return {"status": "error", "error": f"unknown command: {cmd}"}
+        resp = {"status": "error", "error": f"unknown command: {cmd}"}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
 
+    _request_local.node_cache = {}
     try:
         result = nuke.executeInMainThreadWithResult(handler, args=(params,))
-        return {"status": "ok", "result": result}
+        resp = {"status": "ok", "result": result}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
     except Exception as e:
-        return {
+        resp = {
             "status": "error",
             "error": str(e),
+            "error_class": type(e).__name__,
             "traceback": traceback.format_exc(),
         }
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
+    finally:
+        _request_local.node_cache = None
 
 
 def _json_safe(obj: Any) -> Any:
@@ -523,6 +607,9 @@ def _handle_read_comp(params: dict) -> dict:
     if limit:
         nodes = nodes[:limit]
 
+    # B7: single-pass knob iteration. The previous implementation walked
+    # ``n.knobs()`` once for changed values and a second time for
+    # expressions. Now we collect both in one pass per node.
     result = []
     for n in nodes:
         try:
@@ -545,14 +632,24 @@ def _handle_read_comp(params: dict) -> dict:
             # summary mode: skip knobs and expressions to save tokens
             if not summary:
                 changed: dict[str, Any] = {}
+                exprs: dict[str, str] = {}
                 for k in n.knobs():
                     if k in _SKIP_KNOBS:
                         continue
                     knob = n.knob(k)
+                    # Single-pass: capture expressions and non-default values
+                    # in the same iteration.
+                    try:
+                        has_expr = knob.hasExpression()
+                    except Exception:
+                        has_expr = False
+                    if has_expr:
+                        with contextlib.suppress(Exception):
+                            exprs[k] = knob.expression()
                     try:
                         is_relevant = (
                             knob.isAnimated()
-                            or knob.hasExpression()
+                            or has_expr
                             or (hasattr(knob, "isDefault") and not knob.isDefault())
                         )
                     except Exception:
@@ -568,16 +665,6 @@ def _handle_read_comp(params: dict) -> dict:
                             changed[k] = "<unreadable>"
                 if changed:
                     entry["knobs"] = changed
-
-                # expressions
-                exprs = {}
-                for k in n.knobs():
-                    knob = n.knob(k)
-                    try:
-                        if knob.hasExpression():
-                            exprs[k] = knob.expression()
-                    except Exception:
-                        pass
                 if exprs:
                     entry["expressions"] = exprs
 
@@ -992,6 +1079,433 @@ def _handle_set_node_position(params: dict) -> dict:
     return {"results": results, "count": len(results)}
 
 
+# ---------------------------------------------------------------------------
+# A3: typed comp/render handlers
+#
+# These replace the f-string ``execute_python`` blobs that ``comp.py`` and
+# ``render.py:setup_write`` shipped to the addon. Each handler validates
+# its inputs (operation allowlists, path traversal) and raises ValueError
+# on bad input -- ``_dispatch`` formats that into the structured error
+# envelope.
+# ---------------------------------------------------------------------------
+
+# Allowlists -- operations that map to a Nuke node class. Anything
+# outside the set raises ``invalid operation`` so a caller can't drive
+# arbitrary ``getattr(nuke.nodes, X)`` lookups.
+_COLOR_OPERATIONS = frozenset({"Grade", "ColorCorrect", "HueCorrect", "OCIOColorSpace"})
+_MERGE_OPERATIONS = frozenset(
+    {
+        "over",
+        "plus",
+        "multiply",
+        "screen",
+        "stencil",
+        "mask",
+        "minus",
+        "difference",
+        "divide",
+        "from",
+        "copy",
+    }
+)
+_TRANSFORM_OPERATIONS = frozenset({"Transform", "CornerPin2D", "Reformat", "Tracker4"})
+_KEYER_TYPES = frozenset({"Keylight", "Primatte", "IBKGizmo", "Cryptomatte"})
+_WRITE_FILE_TYPES = frozenset({"exr", "tiff", "tif", "png", "jpeg", "jpg", "mov", "dpx"})
+
+
+def _handle_setup_keying(params: dict) -> dict:
+    """Build the standard keying chain: keyer + FilterErode + EdgeBlur + Premult.
+
+    A3 typed: replaces ``comp.py``'s f-string ``execute_python`` payload.
+    Looks up ``input_node`` via the per-request node cache.
+    """
+    import nuke
+
+    input_node = params["input_node"]
+    keyer_type = params.get("keyer_type", "Keylight")
+
+    if keyer_type not in _KEYER_TYPES:
+        raise ValueError(f"invalid keyer_type: {keyer_type}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    # TODO(A3-followup): idempotency -- detect existing keyer chain
+    # downstream of ``input_node`` of the same ``keyer_type`` and return
+    # that instead of creating a duplicate. Skipped here to avoid an
+    # over-engineered first pass; the IDEMPOTENT annotation is honest
+    # only when the caller hasn't run the tool yet.
+
+    x, y = src.xpos(), src.ypos()
+
+    keyer = getattr(nuke.nodes, keyer_type)()
+    keyer.setInput(0, src)
+    keyer.setXYpos(x, y + 60)
+
+    erode = nuke.nodes.FilterErode()
+    erode.setInput(0, keyer)
+    if erode.knob("channels"):
+        erode["channels"].setValue("alpha")
+    if erode.knob("size"):
+        erode["size"].setValue(-0.5)
+    erode.setXYpos(x, y + 120)
+
+    edge = nuke.nodes.EdgeBlur()
+    edge.setInput(0, erode)
+    if edge.knob("size"):
+        edge["size"].setValue(3)
+    edge.setXYpos(x, y + 180)
+
+    premult = nuke.nodes.Premult()
+    premult.setInput(0, edge)
+    premult.setXYpos(x, y + 240)
+
+    return {
+        "keyer": keyer.name(),
+        "erode": erode.name(),
+        "edge_blur": edge.name(),
+        "premult": premult.name(),
+        "tip": "adjust the keyer node settings and erode size to refine the matte",
+    }
+
+
+def _handle_setup_color_correction(params: dict) -> dict:
+    """Create a color-correction node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+    operation = params.get("operation", "Grade")
+
+    if operation not in _COLOR_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    cc = getattr(nuke.nodes, operation)()
+    cc.setInput(0, src)
+    cc.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": cc.name(), "type": cc.Class()}
+
+
+def _handle_setup_merge(params: dict) -> dict:
+    """Create a Merge2 with fg on B pipe (input 1) and bg on A pipe (input 0)."""
+    import nuke
+
+    fg_name = params["fg"]
+    bg_name = params["bg"]
+    operation = params.get("operation", "over")
+
+    if operation not in _MERGE_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    fg_node = _resolve_node(fg_name)
+    bg_node = _resolve_node(bg_name)
+    if fg_node is None:
+        raise ValueError(f"fg node not found: {fg_name}")
+    if bg_node is None:
+        raise ValueError(f"bg node not found: {bg_name}")
+
+    merge = nuke.nodes.Merge2()
+    merge["operation"].setValue(operation)
+    merge.setInput(0, bg_node)  # A pipe = bg
+    merge.setInput(1, fg_node)  # B pipe = fg
+    merge.setXYpos(
+        (fg_node.xpos() + bg_node.xpos()) // 2,
+        max(fg_node.ypos(), bg_node.ypos()) + 80,
+    )
+
+    return {"name": merge.name(), "operation": operation}
+
+
+def _handle_setup_transform(params: dict) -> dict:
+    """Create a transform node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+    operation = params.get("operation", "Transform")
+
+    if operation not in _TRANSFORM_OPERATIONS:
+        raise ValueError(f"invalid operation: {operation}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    t = getattr(nuke.nodes, operation)()
+    t.setInput(0, src)
+    t.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": t.name(), "type": t.Class()}
+
+
+def _handle_setup_denoise(params: dict) -> dict:
+    """Create a Denoise2 node downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    dn = nuke.nodes.Denoise2()
+    dn.setInput(0, src)
+    dn.setXYpos(src.xpos(), src.ypos() + 60)
+
+    return {"name": dn.name(), "type": dn.Class()}
+
+
+# Windows-reserved device basenames -- a path whose final segment matches
+# one of these (case-insensitive, with or without an extension) refers to
+# a device, not a file. Writing to ``CON``, ``PRN`` etc. has historically
+# been a hang/crash source on Windows.
+_WIN_RESERVED_DEVICES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+class PathPolicyViolation(ValueError):
+    """Raised when a write path fails the policy check.
+
+    Carries an ``error_class`` attribute so the wire envelope surfaces
+    ``PathPolicyViolation`` rather than the generic ``ValueError`` from
+    the addon's exception path.
+    """
+
+    error_class = "PathPolicyViolation"
+
+
+def _allowed_write_roots() -> list[str]:
+    """Return the list of absolute roots a setup_write path may live under.
+
+    Defaults to the user's home directory plus the ``$SS`` (Salt Spill
+    sandbox) env var if set. ``NUKE_MCP_WRITE_ROOTS`` (semicolon- or
+    os.pathsep-separated) overrides the defaults entirely.
+
+    Empty / missing env values are skipped so a missing ``$SS`` doesn't
+    silently widen the allow-list.
+    """
+    roots: list[str] = []
+    override = os.environ.get("NUKE_MCP_WRITE_ROOTS")
+    if override:
+        roots = [r.strip() for r in override.replace(";", os.pathsep).split(os.pathsep)]
+        return [os.path.normcase(os.path.normpath(r)) for r in roots if r]
+
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        roots.append(home)
+    ss = os.environ.get("SS")
+    if ss:
+        roots.append(ss)
+    return [os.path.normcase(os.path.normpath(r)) for r in roots]
+
+
+def _validate_write_path(path: object) -> str:
+    """Apply the setup_write path policy. Returns the (resolved) path.
+
+    Rejects:
+      * non-string inputs
+      * traversal (``..`` segment)
+      * UNC paths (``\\\\server\\share\\...``)
+      * Windows reserved device basenames (CON, PRN, NUL, COM1, ...)
+      * absolute paths that don't live under any allow-listed root
+
+    Raises PathPolicyViolation on any violation. Relative paths are
+    accepted unconditionally -- they resolve under the script's current
+    working directory inside Nuke, which is the user's choice.
+    """
+    if not isinstance(path, str) or not path:
+        raise PathPolicyViolation("invalid path: must be a non-empty string")
+
+    # Expand ~ first so the absolute-path check sees the resolved form.
+    expanded = os.path.expanduser(path)
+
+    # Traversal: any ``..`` component (cross-platform). Rejecting on the
+    # raw split catches both forward- and back-slash forms.
+    parts = expanded.replace("\\", "/").split("/")
+    if any(p == ".." for p in parts):
+        raise PathPolicyViolation("invalid path: path traversal not permitted")
+
+    # UNC: ``\\server\share\...`` or ``//server/share/...``.
+    if expanded.startswith("\\\\") or expanded.startswith("//"):
+        raise PathPolicyViolation(
+            "invalid path: UNC paths not permitted (network share writes blocked)"
+        )
+
+    # Windows reserved devices: check the final basename without extension.
+    base = os.path.basename(expanded)
+    if base:
+        stem = base.split(".", 1)[0].upper()
+        if stem in _WIN_RESERVED_DEVICES:
+            raise PathPolicyViolation(
+                f"invalid path: Windows reserved device name '{stem}' not permitted"
+            )
+
+    # Absolute-path allow-list. Relative paths skip this check.
+    if os.path.isabs(expanded):
+        normalized = os.path.normcase(os.path.normpath(expanded))
+        roots = _allowed_write_roots()
+        if not roots:
+            raise PathPolicyViolation(
+                "invalid path: absolute writes blocked (no allow-listed roots; "
+                "set NUKE_MCP_WRITE_ROOTS or $SS to enable)"
+            )
+        if not any(normalized == root or normalized.startswith(root + os.sep) for root in roots):
+            raise PathPolicyViolation(
+                "invalid path: absolute path is outside the allow-listed write roots "
+                "(set NUKE_MCP_WRITE_ROOTS to widen)"
+            )
+
+    return expanded
+
+
+def _handle_setup_write(params: dict) -> dict:
+    """Create a Write node downstream of ``input_node`` with validated path/file_type.
+
+    Path policy (see ``_validate_write_path``):
+      * traversal (``..``) -> rejected.
+      * UNC (``\\\\server\\share\\...``) -> rejected.
+      * Windows reserved device basenames -> rejected.
+      * Absolute paths -> rejected unless they live under a root from
+        ``NUKE_MCP_WRITE_ROOTS`` (semicolon-separated) or, by default,
+        ``$HOME`` and ``$SS`` (Salt Spill sandbox).
+      * Relative paths -> accepted (resolved relative to the script's
+        cwd inside Nuke).
+    """
+    import nuke
+
+    input_node = params["input_node"]
+    path = _validate_write_path(params["path"])
+    file_type = params.get("file_type", "exr")
+    colorspace = params.get("colorspace", "scene_linear")
+
+    if file_type not in _WRITE_FILE_TYPES:
+        raise ValueError(f"invalid file_type: {file_type}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    w = nuke.nodes.Write()
+    w.setInput(0, src)
+    w["file"].setValue(path)
+    w["file_type"].setValue(file_type)
+    if w.knob("colorspace"):
+        w["colorspace"].setValue(colorspace)
+
+    return {"name": w.name(), "path": path, "file_type": file_type}
+
+
+# ---------------------------------------------------------------------------
+# B7: scene_digest / scene_delta
+#
+# Compact fingerprint of the node graph for delta-aware turn loops. Ports
+# the pattern from houdini-mcp-beta/houdini_mcp/tools/digest.py:28-200.
+# ---------------------------------------------------------------------------
+
+
+def _compute_digest_hash(data: dict[str, Any]) -> str:
+    """Return md5 hex[:8] over the JSON-serialized digest body."""
+    import hashlib
+
+    # Drop ``hash`` and ``status`` from the body before hashing so the
+    # hash is stable across calls.
+    body = {k: v for k, v in data.items() if k not in ("hash", "status", "changed")}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+
+def _build_scene_digest() -> dict[str, Any]:
+    """Build the scene digest body. Used by both digest and delta handlers."""
+    import nuke
+
+    nodes = nuke.allNodes()
+    counts: dict[str, int] = {}
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for n in nodes:
+        try:
+            cls = n.Class()
+        except Exception:
+            continue
+        counts[cls] = counts.get(cls, 0) + 1
+        try:
+            if n.hasError():
+                errors.append(n.name())
+        except Exception:
+            pass
+        try:
+            if hasattr(n, "warnings") and n.warnings():
+                warnings.append(n.name())
+        except Exception:
+            pass
+
+    selected = [n.name() for n in nuke.selectedNodes()]
+
+    viewer_active = ""
+    display_node = ""
+    try:
+        viewer = nuke.activeViewer()
+        if viewer is not None:
+            v_node = viewer.node()
+            if v_node is not None:
+                viewer_active = v_node.name()
+                inp = v_node.input(0)
+                if inp is not None:
+                    display_node = inp.name()
+    except Exception:
+        pass
+
+    body: dict[str, Any] = {
+        "counts": counts,
+        "total": len(nodes),
+        "errors": errors,
+        "warnings": warnings,
+        "selected": selected,
+        "viewer_active": viewer_active,
+        "display_node": display_node,
+    }
+    return body
+
+
+def _handle_scene_digest(params: dict) -> dict:
+    """Return the full scene digest body plus an md5[:8] hash."""
+    body = _build_scene_digest()
+    body["hash"] = _compute_digest_hash(body)
+    return body
+
+
+def _handle_scene_delta(params: dict) -> dict:
+    """Return early ``{"changed": False, "hash": prev_hash}`` if the digest is unchanged.
+
+    On change, returns the full body with ``changed=True`` and the new
+    ``hash``. The delta handler always builds the full body (cheap on a
+    hot Nuke session) so the early-exit is a wire-level optimization
+    rather than a Nuke-side one. The win is the MCP client gets to skip
+    re-rendering large response payloads on no-op turns.
+    """
+    prev_hash = params.get("prev_hash") or ""
+    body = _build_scene_digest()
+    current_hash = _compute_digest_hash(body)
+    if current_hash == prev_hash:
+        return {"changed": False, "hash": current_hash}
+    body["hash"] = current_hash
+    body["changed"] = True
+    return body
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -1024,4 +1538,14 @@ HANDLERS: dict[str, Any] = {
     "set_knobs": _handle_set_knobs,
     "disconnect_input": _handle_disconnect_input,
     "set_node_position": _handle_set_node_position,
+    # A3 typed comp/render handlers
+    "setup_keying": _handle_setup_keying,
+    "setup_color_correction": _handle_setup_color_correction,
+    "setup_merge": _handle_setup_merge,
+    "setup_transform": _handle_setup_transform,
+    "setup_denoise": _handle_setup_denoise,
+    "setup_write": _handle_setup_write,
+    # B7 scene digest
+    "scene_digest": _handle_scene_digest,
+    "scene_delta": _handle_scene_delta,
 }

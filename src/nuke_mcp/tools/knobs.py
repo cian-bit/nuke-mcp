@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import IDEMPOTENT, READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -11,7 +12,7 @@ if False:
 
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("get_knob")
@@ -24,7 +25,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("get_knob", node=node, knob=knob)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("set_knob")
     def set_knob(node: str, knob: str, value: str | int | float | bool) -> dict:
         """Set a knob value on a node.
@@ -36,7 +37,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("set_knob", node=node, knob=knob, value=value)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("set_knobs")
     def set_knobs(operations: str) -> dict:
         """Set multiple knobs across multiple nodes in one call. Saves round-trips.

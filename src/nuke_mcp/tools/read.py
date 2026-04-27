@@ -7,7 +7,10 @@ structured data with only non-default knob values to save tokens.
 
 from __future__ import annotations
 
+from typing import Any
+
 from nuke_mcp import connection
+from nuke_mcp.annotations import READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -16,7 +19,7 @@ if False:
 
 def register(ctx: ServerContext) -> None:
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_comp")
@@ -42,7 +45,7 @@ def register(ctx: ServerContext) -> None:
             offset: skip this many nodes (for pagination). default 0.
             limit: max nodes to return. 0 means all. use with offset to page through large comps.
         """
-        params: dict[str, str | int | bool] = {"depth": depth}
+        params: dict[str, Any] = {"depth": depth}
         if root:
             params["root"] = root
         if summary:
@@ -56,7 +59,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("read_comp", **params)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_node_detail")
@@ -71,7 +74,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("get_node_info", name=name)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("read_selected")
@@ -82,7 +85,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("read_selected")
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("snapshot_comp")
@@ -95,7 +98,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("snapshot_comp")
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("diff_comp")

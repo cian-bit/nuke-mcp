@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuke_mcp import connection
+from nuke_mcp.annotations import DESTRUCTIVE, IDEMPOTENT, READ_ONLY
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
@@ -10,7 +11,10 @@ if False:
 
 
 def register(ctx: ServerContext) -> None:
-    @ctx.mcp.tool(output_schema=None)
+    # ``create_node`` is NOT idempotent (each call produces a fresh node)
+    # but is also not destructive. Stamp ``destructiveHint=False`` to make
+    # the benign creation path explicit in the schema.
+    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
     @nuke_command("create_node")
     def create_node(
         type: str,
@@ -32,7 +36,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("create_node", **params)
 
     @ctx.mcp.tool(
-        annotations={"destructiveHint": True},
+        annotations=DESTRUCTIVE,
         output_schema=None,
     )
     @nuke_command("delete_node")
@@ -50,7 +54,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("delete_node", name=name)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("find_nodes")
@@ -76,7 +80,7 @@ def register(ctx: ServerContext) -> None:
         return connection.send("find_nodes", **params)
 
     @ctx.mcp.tool(
-        annotations={"readOnlyHint": True},
+        annotations=READ_ONLY,
         output_schema=None,
     )
     @nuke_command("list_nodes")
@@ -91,7 +95,7 @@ def register(ctx: ServerContext) -> None:
             params["root"] = root
         return connection.send("list_nodes", **params)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("connect_nodes")
     def connect_nodes(
         from_node: str,
@@ -110,7 +114,7 @@ def register(ctx: ServerContext) -> None:
             params["input"] = input_index
         return connection.send("connect_nodes", **params)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("auto_layout")
     def auto_layout(selected_only: bool = False) -> dict:
         """Auto-arrange the node graph layout.
@@ -120,7 +124,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("auto_layout", selected_only=selected_only)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("modify_node")
     def modify_node(
         name: str,
@@ -141,7 +145,8 @@ def register(ctx: ServerContext) -> None:
             params["update_expressions"] = update_expressions
         return connection.send("modify_node", **params)
 
-    @ctx.mcp.tool(output_schema=None)
+    # ``create_nodes`` is the bulk variant -- not idempotent, not destructive.
+    @ctx.mcp.tool(annotations={"destructiveHint": False}, output_schema=None)
     @nuke_command("create_nodes")
     def create_nodes(nodes: str) -> dict:
         """Create multiple nodes in one call. Much faster than individual create_node calls.
@@ -155,7 +160,7 @@ def register(ctx: ServerContext) -> None:
         parsed = _json.loads(nodes)
         return connection.send("create_nodes", nodes=parsed)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("disconnect_input")
     def disconnect_node_input(node: str, input_index: int) -> dict:
         """Disconnect a specific input on a node.
@@ -166,7 +171,7 @@ def register(ctx: ServerContext) -> None:
         """
         return connection.send("disconnect_input", node=node, input=input_index)
 
-    @ctx.mcp.tool(output_schema=None)
+    @ctx.mcp.tool(annotations=IDEMPOTENT, output_schema=None)
     @nuke_command("set_node_position")
     def set_node_position(positions: str) -> dict:
         """Set x/y positions for one or more nodes in the DAG. Use for manual layout

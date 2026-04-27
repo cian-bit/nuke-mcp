@@ -1,38 +1,121 @@
-"""TCP socket client for communicating with the Nuke addon."""
+"""TCP socket client for communicating with the Nuke addon.
+
+Phase A2 hardening: composable retry+backoff, per-command-class timeouts,
+request_id round-trip, heartbeat thread for fast-fail crash detection,
+structured error envelope. Addon-side echoes ``_request_id`` from the
+top-level payload back in the response.
+"""
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import functools
 import json
 import logging
+import os
 import random
 import socket
+import threading
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 log = logging.getLogger(__name__)
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 CONNECT_TIMEOUT = 5.0
-RECV_TIMEOUT = 30.0
-RECV_TIMEOUT_RENDER = 300.0
 MAX_RETRIES = 3
 MAX_MSG_SIZE = 16 * 1024 * 1024  # 16MB
+
+# Per-command-class recv timeouts (seconds). Replaces the old
+# RECV_TIMEOUT / RECV_TIMEOUT_RENDER pair. Tools opt in via
+# ``send(cmd, _class="render", ...)``; default class is ``read``.
+TIMEOUT_CLASSES: dict[str, float] = {
+    "read": 30.0,
+    "mutate": 60.0,
+    "render": 900.0,
+    "copycat": 3600.0,
+    "ping": 5.0,
+}
+
+# Heartbeat config. Production runs heartbeat by default; tests disable
+# via fixture by setting NUKE_MCP_HEARTBEAT=0 before connect().
+HEARTBEAT_INTERVAL = 5.0
+HEARTBEAT_MAX_MISSES = 2
+
+RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    TimeoutError,
+    BrokenPipeError,
+    OSError,
+)
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+# -- module state --
 
 _sock: socket.socket | None = None
 _nuke_version: NukeVersion | None = None
 _last_host: str | None = None
 _last_port: int | None = None
+_io_lock = threading.Lock()
+_session_lost = False
+
+# Heartbeat state. Started in connect(), torn down in disconnect().
+_heartbeat_thread: threading.Thread | None = None
+_heartbeat_stop: threading.Event | None = None
+_heartbeat_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+# Probe executor used by probe_existing_connection() for wall-clock-bounded
+# liveness checks. Shared across calls.
+_probe_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
-class ConnectionError(Exception):
+class ConnectionError(Exception):  # noqa: A001 - shadow of builtin is intentional, public API
     pass
 
 
 class CommandError(Exception):
-    pass
+    """Raised when the addon responds with status=error.
+
+    The structured envelope (error_class, error_code, traceback,
+    duration_ms, request_id) is attached as ``.envelope`` for the
+    decorator in ``_helpers.py`` to relay to the MCP client.
+    """
+
+    def __init__(self, message: str, envelope: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.envelope: dict[str, Any] = envelope or {}
+
+
+class ConnectionLostError(ConnectionError):
+    """Raised when a non-idempotent send loses the connection mid-flight.
+
+    The addon may have already executed the command before the socket
+    died -- replaying the payload would risk creating duplicate nodes /
+    re-running a destructive op. Carries ``last_op`` and
+    ``last_request_id`` so the caller (or a future reconciler) can
+    decide what to do.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        last_op: str | None = None,
+        last_request_id: str | None = None,
+        last_class: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.last_op = last_op
+        self.last_request_id = last_request_id
+        self.last_class = last_class
 
 
 @dataclass
@@ -68,50 +151,96 @@ class NukeVersion:
         return f"{self.variant} {self.major}.{self.minor}v{self.patch}"
 
 
+# -- retry decorator --
+
+
+def retry_with_backoff(
+    max_retries: int = MAX_RETRIES,
+    base: float = 1.0,
+    exponential: float = 2.0,
+    max_delay: float = 30.0,
+    jitter: bool = True,
+    retryable: tuple[type[BaseException], ...] = RETRYABLE_EXCEPTIONS,
+) -> Callable[[F], F]:
+    """Retry the wrapped callable on retryable exceptions with exponential backoff.
+
+    Ported from houdini-mcp-beta's connection.py. Jitter caps at 10% of
+    the current delay to prevent thundering-herd under simultaneous
+    reconnects.
+    """
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_exc: BaseException | None = None
+            delay = base
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except retryable as exc:
+                    last_exc = exc
+                    if attempt < max_retries - 1:
+                        sleep_for = min(delay, max_delay)
+                        if jitter:
+                            sleep_for += random.uniform(0, sleep_for * 0.1)
+                        log.warning(
+                            "attempt %d/%d failed: %s, retrying in %.2fs",
+                            attempt + 1,
+                            max_retries,
+                            exc,
+                            sleep_for,
+                        )
+                        time.sleep(sleep_for)
+                        delay *= exponential
+                    else:
+                        log.error("all %d attempts failed: %s", max_retries, exc)
+            assert last_exc is not None
+            raise last_exc
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+# -- connect / disconnect --
+
+
+@retry_with_backoff()
+def _do_connect(host: str, port: int) -> tuple[socket.socket, NukeVersion]:
+    """One connection attempt + handshake. Wrapped by connect() retry."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(CONNECT_TIMEOUT)
+    s.connect((host, port))
+    s.settimeout(TIMEOUT_CLASSES["read"])
+    handshake = _recv_json(s)
+    version = NukeVersion.from_handshake(handshake)
+    return s, version
+
+
 def connect(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> NukeVersion:
     """Connect to Nuke addon. Returns version info from handshake."""
-    global _sock, _nuke_version, _last_host, _last_port
+    global _sock, _nuke_version, _last_host, _last_port, _session_lost
 
     if _sock is not None:
         disconnect()
 
-    delay = 1.0
-    last_err = None
+    s, version = _do_connect(host, port)
+    _sock = s
+    _nuke_version = version
+    _last_host = host
+    _last_port = port
+    _session_lost = False
+    log.info("connected to %s on %s:%d", version, host, port)
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(CONNECT_TIMEOUT)
-            s.connect((host, port))
-            s.settimeout(RECV_TIMEOUT)
+    if _heartbeat_enabled():
+        _start_heartbeat()
 
-            # read handshake
-            handshake = _recv_json(s)
-            _nuke_version = NukeVersion.from_handshake(handshake)
-            _sock = s
-            _last_host = host
-            _last_port = port
-            log.info("connected to %s on %s:%d", _nuke_version, host, port)
-            return _nuke_version
-
-        except (OSError, TimeoutError, json.JSONDecodeError) as e:
-            last_err = e
-            if attempt < MAX_RETRIES - 1:
-                jitter = random.uniform(0, delay * 0.1)
-                log.warning(
-                    "connection attempt %d failed: %s, retrying in %.1fs",
-                    attempt + 1,
-                    e,
-                    delay + jitter,
-                )
-                time.sleep(delay + jitter)
-                delay *= 2
-
-    raise ConnectionError(f"failed to connect after {MAX_RETRIES} attempts: {last_err}")
+    return version
 
 
 def disconnect() -> None:
     global _sock, _nuke_version
+    _stop_heartbeat()
     if _sock is not None:
         with contextlib.suppress(OSError):
             _sock.close()
@@ -121,11 +250,15 @@ def disconnect() -> None:
 
 
 def is_connected() -> bool:
-    return _sock is not None
+    return _sock is not None and not _session_lost
 
 
 def get_version() -> NukeVersion | None:
     return _nuke_version
+
+
+def session_lost() -> bool:
+    return _session_lost
 
 
 def _reconnect() -> None:
@@ -137,71 +270,282 @@ def _reconnect() -> None:
         raise ConnectionError("not connected to Nuke and no previous connection to retry")
 
 
-def send(command: str, **params: Any) -> dict[str, Any]:
+# -- liveness probe --
+
+
+def _get_probe_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _probe_executor
+    if _probe_executor is None:
+        # Houdini-MCP parity: 4 workers covers concurrent probes from
+        # tool calls and the heartbeat loop without queuing.
+        _probe_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="nuke-mcp-probe"
+        )
+    return _probe_executor
+
+
+def probe_existing_connection(timeout: float = 0.5) -> bool:
+    """Wall-clock-bounded liveness check on the cached socket.
+
+    A torn TCP stream still reports ``_sock is not None`` until the next
+    ``recv()`` returns 0 or raises. Waiting that out costs the full
+    per-class timeout. This helper fires a tiny ``ping`` on a worker
+    thread with a 0.5s deadline so callers can cheaply detect a stale
+    socket and reconnect proactively.
+
+    Returns True if the ping round-trips inside ``timeout``, False on
+    any error or timeout. Never raises.
+    """
+    if _sock is None:
+        return False
+
+    def _probe() -> bool:
+        try:
+            send("ping", _class="ping")
+            return True
+        except Exception as exc:
+            log.debug("liveness probe raised: %s", exc)
+            return False
+
+    fut = _get_probe_executor().submit(_probe)
+    try:
+        return bool(fut.result(timeout=timeout))
+    except concurrent.futures.TimeoutError:
+        log.debug("liveness probe timed out after %.2fs", timeout)
+        fut.cancel()
+        return False
+    except Exception as exc:
+        log.debug("liveness probe failed: %s", exc)
+        return False
+
+
+# -- send --
+
+
+def send(command: str, *, _class: str = "read", **params: Any) -> dict[str, Any]:
     """Send a command to Nuke and return the response.
 
-    Auto-reconnects once if the connection has dropped.
-    Raises ConnectionError if not connected and reconnect fails.
-    Raises CommandError if Nuke reports an error.
+    Args:
+        command: handler name on the addon side (``ping``, ``create_node``, ...).
+        _class: timeout class key (``read``, ``mutate``, ``render``,
+            ``copycat``, ``ping``). Determines the recv timeout for this
+            single call. Defaults to ``read``.
+        **params: forwarded as the ``params`` dict in the wire payload.
+
+    Auto-reconnects once on send failure. Adds a request_id (uuid4
+    hex[:16] = 64 bits, collision-safe at session scale) at the payload
+    root; the addon echoes it back and a mismatch raises ConnectionError.
     """
-    global _sock
+    global _sock, _session_lost
 
     if _sock is None:
         _reconnect()
-
     assert _sock is not None  # connect() sets _sock or raises
 
-    msg = {"type": command, "params": params}
+    timeout = TIMEOUT_CLASSES.get(_class, TIMEOUT_CLASSES["read"])
+
+    rid = uuid.uuid4().hex[:16]
+    msg = {"type": command, "params": params, "_request_id": rid}
+
+    started = time.perf_counter()
+
     try:
-        _send_json(_sock, msg)
-        resp = _recv_json(_sock)
-    except (ConnectionError, OSError):
+        resp = _io_round_trip(msg, timeout)
+    except (ConnectionError, OSError, TimeoutError) as exc:
+        # Auto-replay is only safe for idempotent classes. ``mutate``,
+        # ``render``, ``copycat`` may have already executed addon-side
+        # before the socket died -- replaying would create duplicate
+        # nodes or re-run destructive ops. Raise a typed error and
+        # leave reconciliation to the caller.
+        if _class not in ("read", "ping"):
+            with contextlib.suppress(Exception):
+                disconnect()
+            raise ConnectionLostError(
+                f"connection lost during non-idempotent op '{command}' "
+                f"(class={_class}, request_id={rid}): {exc}",
+                last_op=command,
+                last_request_id=rid,
+                last_class=_class,
+            ) from exc
+        # Read paths still auto-retry: they're idempotent by definition.
         disconnect()
         _reconnect()
         assert _sock is not None
-        _send_json(_sock, msg)
-        resp = _recv_json(_sock)
+        resp = _io_round_trip(msg, timeout)
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    echoed_rid = resp.get("_request_id")
+    if echoed_rid is not None and echoed_rid != rid:
+        raise ConnectionError(f"request_id mismatch: sent {rid}, got {echoed_rid}")
 
     if resp.get("status") == "error":
-        raise CommandError(resp.get("error", "unknown error"))
+        envelope = {
+            "error_class": resp.get("error_class") or "CommandError",
+            "error_code": resp.get("error_code"),
+            "traceback": resp.get("traceback"),
+            "duration_ms": duration_ms,
+            "request_id": rid,
+        }
+        raise CommandError(resp.get("error", "unknown error"), envelope=envelope)
 
     return resp.get("result", {})
 
 
+def send_class(command: str, _class: str, **params: Any) -> dict[str, Any]:
+    """Convenience wrapper around send() with explicit timeout class.
+
+    Identical to ``send(command, _class=_class, **params)`` -- exists
+    only to avoid the leading-underscore-kwarg awkwardness when callers
+    already have ``_class`` bound to a local variable.
+    """
+    return send(command, _class=_class, **params)
+
+
+def _io_round_trip(msg: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Single send+recv cycle under the I/O lock with a per-call timeout."""
+    assert _sock is not None
+    with _io_lock:
+        old_timeout = _sock.gettimeout()
+        try:
+            _sock.settimeout(timeout)
+            _send_json(_sock, msg)
+            return _recv_json(_sock)
+        finally:
+            with contextlib.suppress(OSError):
+                _sock.settimeout(old_timeout)
+
+
+# -- backwards-compat helpers --
+
+
 def send_raw(command: str, timeout: float | None = None, **params: Any) -> dict[str, Any]:
-    """Like send() but with a custom timeout. Used for renders."""
+    """Like send() but with a custom timeout. Kept for back-compat callers.
+
+    Prefer ``send(command, _class=...)`` for new code. The custom-timeout
+    branch performs the same request_id round-trip + structured error
+    envelope as ``send`` so callers don't lose envelope fields just
+    because they chose an off-spec timeout.
+    """
     if _sock is None:
         raise ConnectionError("not connected to Nuke")
-
-    old_timeout = _sock.gettimeout()
-    try:
-        if timeout is not None:
-            _sock.settimeout(timeout)
+    if timeout is None:
         return send(command, **params)
-    finally:
-        _sock.settimeout(old_timeout)
+    # map the explicit timeout onto a class lookup if it matches a known
+    # value, otherwise fall through to the custom-timeout path below.
+    for name, value in TIMEOUT_CLASSES.items():
+        if abs(value - timeout) < 1e-6:
+            return send(command, _class=name, **params)
+
+    rid = uuid.uuid4().hex[:16]
+    msg = {"type": command, "params": params, "_request_id": rid}
+    started = time.perf_counter()
+    resp = _io_round_trip(msg, timeout)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    echoed_rid = resp.get("_request_id")
+    if echoed_rid is not None and echoed_rid != rid:
+        raise ConnectionError(f"request_id mismatch: sent {rid}, got {echoed_rid}")
+
+    if resp.get("status") == "error":
+        envelope = {
+            "error_class": resp.get("error_class") or "CommandError",
+            "error_code": resp.get("error_code"),
+            "traceback": resp.get("traceback"),
+            "duration_ms": duration_ms,
+            "request_id": rid,
+        }
+        raise CommandError(resp.get("error", "unknown error"), envelope=envelope)
+    return resp.get("result", {})
 
 
 def ping() -> bool:
     """Check if Nuke is still responding."""
     try:
-        send_raw("ping", timeout=5.0)
+        send("ping", _class="ping")
         return True
     except (ConnectionError, CommandError, OSError):
         return False
 
 
+# -- heartbeat --
+
+
+def _heartbeat_enabled() -> bool:
+    return os.environ.get("NUKE_MCP_HEARTBEAT", "1") not in ("0", "false", "False", "")
+
+
+def _start_heartbeat() -> None:
+    global _heartbeat_thread, _heartbeat_stop
+    if _heartbeat_thread is not None and _heartbeat_thread.is_alive():
+        return
+    _heartbeat_stop = threading.Event()
+    _heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(_heartbeat_stop,),
+        name="nuke-mcp-heartbeat",
+        daemon=True,
+    )
+    _heartbeat_thread.start()
+
+
+def _stop_heartbeat() -> None:
+    """Signal the heartbeat thread to exit and join it.
+
+    The heartbeat loop calls ``disconnect()`` from inside its own thread
+    when ``HEARTBEAT_MAX_MISSES`` is exceeded; ``disconnect()`` in turn
+    calls ``_stop_heartbeat()``. Joining a thread from itself raises
+    ``RuntimeError``, so the self-thread case skips the join and lets
+    the loop return naturally.
+    """
+    global _heartbeat_thread, _heartbeat_stop
+    if _heartbeat_stop is not None:
+        _heartbeat_stop.set()
+    thread = _heartbeat_thread
+    if thread is not None and threading.current_thread() is not thread:
+        thread.join(timeout=1.0)
+    _heartbeat_thread = None
+    _heartbeat_stop = None
+
+
+def _heartbeat_loop(stop: threading.Event) -> None:
+    """Fire ``ping`` every HEARTBEAT_INTERVAL; flag session_lost on misses.
+
+    Uses ``Event.wait`` for clean shutdown -- never burns CPU when the
+    stop flag is set, and any sleep gets cut short on disconnect().
+    """
+    global _session_lost
+    misses = 0
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        if _sock is None:
+            return
+        try:
+            send("ping", _class="ping")
+            misses = 0
+        except Exception as exc:
+            misses += 1
+            log.warning("heartbeat miss %d/%d: %s", misses, HEARTBEAT_MAX_MISSES, exc)
+            if misses >= HEARTBEAT_MAX_MISSES:
+                log.error("heartbeat: %d consecutive misses, declaring session lost", misses)
+                _session_lost = True
+                # disconnect from a worker thread is fine -- _io_lock
+                # protects concurrent socket access.
+                with contextlib.suppress(Exception):
+                    disconnect()
+                return
+
+
 # -- wire format --
 
 
-def _send_json(s: socket.socket, data: dict) -> None:
+def _send_json(s: socket.socket, data: dict[str, Any]) -> None:
     payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_MSG_SIZE:
         raise ConnectionError(f"message too large: {len(payload)} bytes")
     s.sendall(payload + b"\n")
 
 
-def _recv_json(s: socket.socket) -> dict:
+def _recv_json(s: socket.socket) -> dict[str, Any]:
     buf = b""
     while True:
         try:
