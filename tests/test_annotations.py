@@ -97,6 +97,19 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     # digest.py (B7)
     "scene_digest": READ_ONLY,
     "scene_delta": READ_ONLY,
+    # tracking.py (C1)
+    "setup_camera_tracker": BENIGN_NEW,
+    "setup_planar_tracker": BENIGN_NEW,
+    "setup_tracker4": BENIGN_NEW,
+    "bake_tracker_to_corner_pin": BENIGN_NEW,
+    "solve_3d_camera": BENIGN_NEW,
+    "bake_camera_to_card": BENIGN_NEW,
+    # deep.py (C1)
+    "create_deep_recolor": BENIGN_NEW,
+    "create_deep_merge": BENIGN_NEW,
+    "create_deep_holdout": BENIGN_NEW,
+    "create_deep_transform": BENIGN_NEW,
+    "deep_to_image": BENIGN_NEW,
 }
 
 

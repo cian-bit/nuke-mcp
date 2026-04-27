@@ -15,15 +15,19 @@ attribute access becomes available downstream.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import READ_ONLY
 from nuke_mcp.models import DiffResult, NodeInfo
+from nuke_mcp.models._warnings import warn_once
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
     from nuke_mcp.server import ServerContext
+
+log = logging.getLogger(__name__)
 
 
 def _model_dump(model: Any) -> dict[str, Any]:
@@ -86,9 +90,15 @@ def register(ctx: ServerContext) -> None:
                 if isinstance(entry, dict):
                     try:
                         typed_nodes.append(_model_dump(NodeInfo.model_validate(entry)))
-                    except Exception:
+                    except Exception as exc:
                         # Defensive: never fail closed on a model error -- a
                         # malformed node entry shouldn't sink the whole call.
+                        warn_once(
+                            log,
+                            "read_comp.nodes",
+                            "read_comp: NodeInfo validation failed; returning raw node entry: %s",
+                            exc,
+                        )
                         typed_nodes.append(entry)
                 else:
                     typed_nodes.append(entry)
@@ -112,7 +122,13 @@ def register(ctx: ServerContext) -> None:
         if isinstance(result, dict):
             try:
                 return _model_dump(NodeInfo.model_validate(result))
-            except Exception:
+            except Exception as exc:
+                warn_once(
+                    log,
+                    "read_node_detail",
+                    "read_node_detail: NodeInfo validation failed; returning raw payload: %s",
+                    exc,
+                )
                 return result
         return result
 
@@ -156,6 +172,12 @@ def register(ctx: ServerContext) -> None:
         if isinstance(result, dict) and "added" in result and "removed" in result:
             try:
                 return _model_dump(DiffResult.model_validate(result))
-            except Exception:
+            except Exception as exc:
+                warn_once(
+                    log,
+                    "diff_comp",
+                    "diff_comp: DiffResult validation failed; returning raw payload: %s",
+                    exc,
+                )
                 return result
         return result

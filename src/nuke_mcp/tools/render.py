@@ -8,16 +8,20 @@ preserving the original keys via ``extra="allow"``.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from nuke_mcp import connection
 from nuke_mcp.annotations import BENIGN_NEW, DESTRUCTIVE, OPEN_WORLD, READ_ONLY
 from nuke_mcp.main_thread import run_on_main
 from nuke_mcp.models import RenderResult
+from nuke_mcp.models._warnings import warn_once
 from nuke_mcp.tools._helpers import nuke_command
 
 if False:
     from nuke_mcp.server import ServerContext
+
+log = logging.getLogger(__name__)
 
 
 def _model_dump(model: Any) -> dict[str, Any]:
@@ -96,7 +100,13 @@ def register(ctx: ServerContext) -> None:
         if isinstance(result, dict) and "rendered" in result:
             try:
                 return _model_dump(RenderResult.model_validate(result))
-            except Exception:
+            except Exception as exc:
+                warn_once(
+                    log,
+                    "render_frames",
+                    "render_frames: RenderResult validation failed; returning raw payload: %s",
+                    exc,
+                )
                 return result
         return result
 
