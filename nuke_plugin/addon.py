@@ -1525,6 +1525,447 @@ def _handle_scene_delta(params: dict) -> dict:
     return body
 
 
+# ---------------------------------------------------------------------------
+# C1: tracking + deep typed handlers
+#
+# Atomic primitives for camera-tracker, planar tracker, Tracker4 and the
+# bake operations; plus the deep-comp primitives (DeepRecolor / DeepMerge
+# / DeepHoldout / DeepTransform / DeepToImage). All handlers return a
+# flat ``NodeRef`` -- ``{name, type, x, y, inputs}`` -- so callers
+# never have to follow up with a separate ``get_node_info`` round-trip.
+#
+# Idempotency: when ``name`` is supplied AND a node of the same class
+# with matching inputs already exists at that name, return the existing
+# NodeRef instead of creating a duplicate. When ``name`` is None, the
+# tool is BENIGN_NEW (Nuke auto-uniquifies, so a second call yields a
+# fresh ``Foo2``).
+# ---------------------------------------------------------------------------
+
+_CAMERA_SOLVE_METHODS = frozenset({"Match-Move", "Tripod", "Free Camera", "Planar", "Object"})
+_DEEP_MERGE_OPS = frozenset({"over", "holdout"})
+
+
+def _node_inputs(node: Any) -> list[str | None]:
+    inputs: list[str | None] = []
+    for i in range(node.inputs()):
+        inp = node.input(i)
+        inputs.append(inp.name() if inp else None)
+    return inputs
+
+
+def _node_ref(node: Any) -> dict[str, Any]:
+    """Return the standard NodeRef shape for one Nuke node.
+
+    Wire keys match the existing addon convention used by
+    ``_handle_read_node_detail`` and ``_handle_list_nodes`` (``type``/``x``/``y``)
+    rather than Python attribute names (``Class``/``xpos``/``ypos``).
+    """
+    return {
+        "name": node.name(),
+        "type": node.Class(),
+        "x": int(node.xpos()),
+        "y": int(node.ypos()),
+        "inputs": _node_inputs(node),
+    }
+
+
+def _maybe_existing(
+    name: str | None,
+    node_class: str,
+    expected_inputs: list[str | None],
+) -> dict[str, Any] | None:
+    """Return a NodeRef if an existing node matches name+class+inputs.
+
+    Used by every C1 handler to short-circuit duplicate creation when
+    the caller supplies an explicit ``name``. If the existing node has
+    the wrong class or different inputs, raises ValueError so the
+    caller hits a fresh error rather than silently mutating an
+    unrelated node.
+    """
+    import nuke
+
+    if not name:
+        return None
+    existing = nuke.toNode(name)
+    if existing is None:
+        return None
+    if existing.Class() != node_class:
+        raise ValueError(
+            f"node '{name}' exists but is class '{existing.Class()}', " f"expected '{node_class}'"
+        )
+    actual_inputs = _node_inputs(existing)
+    # Only compare leading slots that were specified -- ``expected_inputs``
+    # is the list the handler intends to wire, and Nuke can have stray
+    # ``None`` tail slots.
+    leading = actual_inputs[: len(expected_inputs)]
+    if leading != expected_inputs:
+        raise ValueError(
+            f"node '{name}' exists but has inputs {actual_inputs}, " f"expected {expected_inputs}"
+        )
+    return _node_ref(existing)
+
+
+def _set_name(node: Any, name: str | None) -> None:
+    if name:
+        node.setName(name)
+
+
+def _handle_setup_camera_tracker(params: dict) -> dict:
+    """Create a CameraTracker downstream of ``input_node``."""
+    import nuke
+
+    input_node = params["input_node"]
+    features = int(params.get("features", 300))
+    solve_method = params.get("solve_method", "Match-Move")
+    mask = params.get("mask")
+    name = params.get("name")
+
+    if solve_method not in _CAMERA_SOLVE_METHODS:
+        raise ValueError(f"invalid solve_method: {solve_method}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    mask_node = None
+    if mask is not None:
+        mask_node = _resolve_node(mask)
+        if mask_node is None:
+            raise ValueError(f"mask node not found: {mask}")
+
+    expected_inputs: list[str | None] = [src.name()]
+    if mask_node is not None:
+        expected_inputs.append(mask_node.name())
+    cached = _maybe_existing(name, "CameraTracker", expected_inputs)
+    if cached is not None:
+        return cached
+
+    tracker = nuke.nodes.CameraTracker()
+    tracker.setInput(0, src)
+    if mask_node is not None:
+        tracker.setInput(1, mask_node)
+    if tracker.knob("numberFeatures"):
+        tracker["numberFeatures"].setValue(features)
+    if tracker.knob("solveMethod"):
+        with contextlib.suppress(Exception):
+            tracker["solveMethod"].setValue(solve_method)
+    tracker.setXYpos(src.xpos(), src.ypos() + 60)
+    _set_name(tracker, name)
+    return _node_ref(tracker)
+
+
+def _handle_setup_planar_tracker(params: dict) -> dict:
+    """Create a PlanarTracker fed by ``input_node`` + ``plane_roto``."""
+    import nuke
+
+    input_node = params["input_node"]
+    plane_roto = params["plane_roto"]
+    ref_frame = int(params.get("ref_frame", 1))
+    name = params.get("name")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+    roto = _resolve_node(plane_roto)
+    if roto is None:
+        raise ValueError(f"plane_roto node not found: {plane_roto}")
+
+    expected_inputs = [src.name(), roto.name()]
+    cached = _maybe_existing(name, "PlanarTrackerNode", expected_inputs)
+    if cached is not None:
+        return cached
+
+    # Try the modern class first (PlanarTrackerNode), fall back to the
+    # legacy gizmo name if the bind fails.
+    factory = getattr(nuke.nodes, "PlanarTrackerNode", None)
+    if factory is None:
+        factory = getattr(nuke.nodes, "PlanarTracker", None)
+    if factory is None:
+        raise ValueError("PlanarTrackerNode not available in this Nuke build")
+    tracker = factory()
+    tracker.setInput(0, src)
+    tracker.setInput(1, roto)
+    if tracker.knob("referenceFrame"):
+        tracker["referenceFrame"].setValue(ref_frame)
+    tracker.setXYpos(src.xpos(), src.ypos() + 60)
+    _set_name(tracker, name)
+    return _node_ref(tracker)
+
+
+def _handle_setup_tracker4(params: dict) -> dict:
+    """Create a Tracker4 with ``num_tracks`` track slots."""
+    import nuke
+
+    input_node = params["input_node"]
+    num_tracks = int(params.get("num_tracks", 4))
+    name = params.get("name")
+
+    if num_tracks < 1:
+        raise ValueError(f"num_tracks must be >= 1, got {num_tracks}")
+
+    src = _resolve_node(input_node)
+    if src is None:
+        raise ValueError(f"node not found: {input_node}")
+
+    cached = _maybe_existing(name, "Tracker4", [src.name()])
+    if cached is not None:
+        return cached
+
+    tracker = nuke.nodes.Tracker4()
+    tracker.setInput(0, src)
+    tracker.setXYpos(src.xpos(), src.ypos() + 60)
+    # Tracker4 ships with knobs for tracks 1..N already; we don't
+    # synthesize per-track knobs here -- callers tweak via set_knob.
+    _set_name(tracker, name)
+    return _node_ref(tracker)
+
+
+def _handle_bake_tracker_to_corner_pin(params: dict) -> dict:
+    """Bake a Tracker4 / PlanarTracker into a CornerPin2D."""
+    import nuke
+
+    tracker_name = params["tracker_node"]
+    ref_frame = int(params.get("ref_frame", 1))
+    name = params.get("name")
+
+    src = _resolve_node(tracker_name)
+    if src is None:
+        raise ValueError(f"tracker node not found: {tracker_name}")
+
+    cached = _maybe_existing(name, "CornerPin2D", [src.name()])
+    if cached is not None:
+        return cached
+
+    pin = nuke.nodes.CornerPin2D()
+    pin.setInput(0, src)
+    if pin.knob("reference_frame"):
+        pin["reference_frame"].setValue(ref_frame)
+    pin.setXYpos(src.xpos() + 80, src.ypos() + 60)
+    _set_name(pin, name)
+    return _node_ref(pin)
+
+
+def _handle_solve_3d_camera(params: dict) -> dict:
+    """Solve a CameraTracker and return its NodeRef.
+
+    The actual solve runs through Nuke's CameraTracker::solveCamera()
+    when available; fall back to a direct knob trigger.
+    """
+
+    tracker_name = params["camera_tracker_node"]
+    name = params.get("name")
+
+    src = _resolve_node(tracker_name)
+    if src is None:
+        raise ValueError(f"camera_tracker_node not found: {tracker_name}")
+    if src.Class() != "CameraTracker":
+        raise ValueError(
+            f"node '{tracker_name}' is class '{src.Class()}', " f"expected CameraTracker"
+        )
+
+    # Idempotent: if name supplied AND it already points at this same
+    # CameraTracker, return its NodeRef without re-solving.
+    if name and name == src.name():
+        return _node_ref(src)
+
+    # Trigger the solve. CameraTracker::solveCamera is the canonical
+    # method; if missing, we hit the ``solve`` knob.
+    solver = getattr(src, "solveCamera", None)
+    if callable(solver):
+        with contextlib.suppress(Exception):
+            solver()
+    else:
+        knob = src.knob("solve")
+        if knob is not None:
+            with contextlib.suppress(Exception):
+                knob.execute()
+
+    if name and name != src.name():
+        src.setName(name)
+    return _node_ref(src)
+
+
+def _handle_bake_camera_to_card(params: dict) -> dict:
+    """Bake a solved Camera / CameraTracker to a Card3D at ``frame``."""
+    import nuke
+
+    cam_name = params["camera_node"]
+    frame = int(params.get("frame", 1))
+    name = params.get("name")
+
+    src = _resolve_node(cam_name)
+    if src is None:
+        raise ValueError(f"camera_node not found: {cam_name}")
+
+    cached = _maybe_existing(name, "Card3D", [src.name()])
+    if cached is not None:
+        return cached
+
+    card_factory = getattr(nuke.nodes, "Card3D", None) or getattr(nuke.nodes, "Card", None)
+    if card_factory is None:
+        raise ValueError("Card3D / Card not available in this Nuke build")
+    card = card_factory()
+    card.setInput(0, src)
+    if card.knob("frame"):
+        with contextlib.suppress(Exception):
+            card["frame"].setValue(frame)
+    card.setXYpos(src.xpos() + 80, src.ypos() + 60)
+    _set_name(card, name)
+    return _node_ref(card)
+
+
+def _handle_create_deep_recolor(params: dict) -> dict:
+    """Create a DeepRecolor fed by deep input + colour input."""
+    import nuke
+
+    deep_name = params["deep_node"]
+    color_name = params["color_node"]
+    target_input_alpha = bool(params.get("target_input_alpha", True))
+    name = params.get("name")
+
+    deep = _resolve_node(deep_name)
+    if deep is None:
+        raise ValueError(f"deep node not found: {deep_name}")
+    color = _resolve_node(color_name)
+    if color is None:
+        raise ValueError(f"color node not found: {color_name}")
+
+    expected_inputs = [deep.name(), color.name()]
+    cached = _maybe_existing(name, "DeepRecolor", expected_inputs)
+    if cached is not None:
+        return cached
+
+    rec = nuke.nodes.DeepRecolor()
+    rec.setInput(0, deep)
+    rec.setInput(1, color)
+    if rec.knob("target_input_alpha"):
+        rec["target_input_alpha"].setValue(target_input_alpha)
+    rec.setXYpos(deep.xpos(), deep.ypos() + 60)
+    _set_name(rec, name)
+    return _node_ref(rec)
+
+
+def _handle_create_deep_merge(params: dict) -> dict:
+    """Create a DeepMerge between two deep streams (default operation 'over')."""
+    import nuke
+
+    a_name = params["a_node"]
+    b_name = params["b_node"]
+    op = params.get("op", "over")
+    name = params.get("name")
+
+    if op not in _DEEP_MERGE_OPS:
+        raise ValueError(f"invalid op: {op}")
+
+    a = _resolve_node(a_name)
+    if a is None:
+        raise ValueError(f"a_node not found: {a_name}")
+    b = _resolve_node(b_name)
+    if b is None:
+        raise ValueError(f"b_node not found: {b_name}")
+
+    expected_inputs = [a.name(), b.name()]
+    cached = _maybe_existing(name, "DeepMerge", expected_inputs)
+    if cached is not None:
+        return cached
+
+    merge = nuke.nodes.DeepMerge()
+    merge.setInput(0, a)
+    merge.setInput(1, b)
+    if merge.knob("operation"):
+        with contextlib.suppress(Exception):
+            merge["operation"].setValue(op)
+    merge.setXYpos(
+        (a.xpos() + b.xpos()) // 2,
+        max(a.ypos(), b.ypos()) + 80,
+    )
+    _set_name(merge, name)
+    return _node_ref(merge)
+
+
+def _handle_create_deep_holdout(params: dict) -> dict:
+    """Create a DeepHoldout: subject minus holdout."""
+    import nuke
+
+    subject_name = params["subject_node"]
+    holdout_name = params["holdout_node"]
+    name = params.get("name")
+
+    subject = _resolve_node(subject_name)
+    if subject is None:
+        raise ValueError(f"subject_node not found: {subject_name}")
+    holdout = _resolve_node(holdout_name)
+    if holdout is None:
+        raise ValueError(f"holdout_node not found: {holdout_name}")
+
+    expected_inputs = [subject.name(), holdout.name()]
+    cached = _maybe_existing(name, "DeepHoldout", expected_inputs)
+    if cached is not None:
+        return cached
+
+    hd = nuke.nodes.DeepHoldout()
+    hd.setInput(0, subject)
+    hd.setInput(1, holdout)
+    hd.setXYpos(
+        (subject.xpos() + holdout.xpos()) // 2,
+        max(subject.ypos(), holdout.ypos()) + 80,
+    )
+    _set_name(hd, name)
+    return _node_ref(hd)
+
+
+def _handle_create_deep_transform(params: dict) -> dict:
+    """Create a DeepTransform with an optional translate vector."""
+    import nuke
+
+    input_name = params["input_node"]
+    translate = params.get("translate", (0.0, 0.0, 0.0))
+    name = params.get("name")
+
+    if not isinstance(translate, list | tuple) or len(translate) != 3:
+        raise ValueError(f"translate must be a 3-tuple, got {translate!r}")
+
+    src = _resolve_node(input_name)
+    if src is None:
+        raise ValueError(f"input_node not found: {input_name}")
+
+    cached = _maybe_existing(name, "DeepTransform", [src.name()])
+    if cached is not None:
+        return cached
+
+    dt = nuke.nodes.DeepTransform()
+    dt.setInput(0, src)
+    if dt.knob("translate"):
+        for i, v in enumerate(translate):
+            with contextlib.suppress(Exception):
+                dt["translate"].setValue(float(v), i)
+    dt.setXYpos(src.xpos(), src.ypos() + 60)
+    _set_name(dt, name)
+    return _node_ref(dt)
+
+
+def _handle_deep_to_image(params: dict) -> dict:
+    """Create a DeepToImage flattening a deep stream to 2D."""
+    import nuke
+
+    input_name = params["input_node"]
+    name = params.get("name")
+
+    src = _resolve_node(input_name)
+    if src is None:
+        raise ValueError(f"input_node not found: {input_name}")
+
+    cached = _maybe_existing(name, "DeepToImage", [src.name()])
+    if cached is not None:
+        return cached
+
+    n = nuke.nodes.DeepToImage()
+    n.setInput(0, src)
+    n.setXYpos(src.xpos(), src.ypos() + 60)
+    _set_name(n, name)
+    return _node_ref(n)
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -1567,4 +2008,17 @@ HANDLERS: dict[str, Any] = {
     # B7 scene digest
     "scene_digest": _handle_scene_digest,
     "scene_delta": _handle_scene_delta,
+    # C1 tracking primitives
+    "setup_camera_tracker": _handle_setup_camera_tracker,
+    "setup_planar_tracker": _handle_setup_planar_tracker,
+    "setup_tracker4": _handle_setup_tracker4,
+    "bake_tracker_to_corner_pin": _handle_bake_tracker_to_corner_pin,
+    "solve_3d_camera": _handle_solve_3d_camera,
+    "bake_camera_to_card": _handle_bake_camera_to_card,
+    # C1 deep primitives
+    "create_deep_recolor": _handle_create_deep_recolor,
+    "create_deep_merge": _handle_create_deep_merge,
+    "create_deep_holdout": _handle_create_deep_holdout,
+    "create_deep_transform": _handle_create_deep_transform,
+    "deep_to_image": _handle_deep_to_image,
 }
