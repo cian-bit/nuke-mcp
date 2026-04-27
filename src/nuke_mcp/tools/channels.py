@@ -1,4 +1,10 @@
-"""Channel and layer management tools."""
+"""Channel and layer management tools.
+
+``setup_aov_merge`` lived here historically; Phase C3 migrated it to
+``tools/aov.py`` along with the new ``detect_aov_layers`` and
+``setup_karma_aov_pipeline`` workflow tools. The legacy comma-separated
+signature is preserved at the new home.
+"""
 
 from __future__ import annotations
 
@@ -47,43 +53,5 @@ s.setInput(0, src)
 s["in1"].setValue({from_layer!r})
 s["out1"].setValue({to_layer!r})
 __result__ = {{"name": s.name(), "from": {from_layer!r}, "to": {to_layer!r}}}
-"""
-        return connection.send("execute_python", code=code)
-
-    # ``setup_aov_merge`` creates fresh Merge2 chain nodes -- not idempotent.
-    @nuke_tool(ctx, profile="aov", annotations=BENIGN_NEW)
-    @nuke_command("setup_aov_merge")
-    def setup_aov_merge(read_nodes: str) -> dict:
-        """Merge multiple AOV Read nodes together (additive). Common EXR workflow.
-
-        Args:
-            read_nodes: comma-separated list of Read node names to merge.
-        """
-        names = [n.strip() for n in read_nodes.split(",")]
-        names_repr = repr(names)
-        code = f"""
-import nuke
-names = {names_repr}
-nodes = []
-for n in names:
-    node = nuke.toNode(n)
-    if not node:
-        raise ValueError(f"node not found: {{n}}")
-    nodes.append(node)
-
-if len(nodes) < 2:
-    raise ValueError("need at least 2 nodes to merge")
-
-prev = nodes[0]
-merges = []
-for i in range(1, len(nodes)):
-    m = nuke.nodes.Merge2()
-    m["operation"].setValue("plus")
-    m.setInput(1, prev)
-    m.setInput(0, nodes[i])
-    prev = m
-    merges.append(m.name())
-
-__result__ = {{"merges": merges, "final": merges[-1], "inputs": names}}
 """
         return connection.send("execute_python", code=code)

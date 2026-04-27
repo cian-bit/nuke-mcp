@@ -128,8 +128,11 @@ Add to `~/.claude/mcp.json`:
 ### Roto (2)
 - `create_roto`, `list_roto_shapes`
 
-### Other (5)
-- `list_channels`, `shuffle_channels`, `setup_aov_merge`
+### AOV / Channels (5)
+- `list_channels`, `shuffle_channels`
+- `detect_aov_layers`, `setup_karma_aov_pipeline`, `setup_aov_merge`
+
+### Other (3)
 - `view_node`, `set_viewer_lut`
 - `execute_python`
 
