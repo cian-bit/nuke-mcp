@@ -4197,6 +4197,568 @@ def _handle_qc_viewer_pair(params: dict) -> dict:
     return _node_ref(switch)
 
 
+# ---------------------------------------------------------------------------
+# C8 Salt Spill macro orchestrators.
+#
+# Each ``_handle_..._ss`` is a thin wrapper that:
+#
+#   1. Calls one or more existing C-phase sub-handlers to do the actual
+#      node creation. None of these reimplement any wiring -- they
+#      compose what's already been built out for C2/C3/C4/C5/C6/C7/C9.
+#   2. Wraps the resulting children (when the inner handler hasn't
+#      already wrapped them) in a Group named per the macro's own
+#      convention (``KarmaAOV_<shot>``, ``FLIP_Blood_<shot>`` etc.).
+#   3. Stamps a ``BackdropNode`` whose ``label`` is ``<shot> # C8 v1``
+#      so the operator can trace which auto-built block came from which
+#      C-phase tool version.
+#   4. Returns the wrapper Group's ``NodeRef`` plus the Backdrop name.
+#
+# Idempotency: each macro short-circuits when an existing wrapper Group
+# of the requested name is found. The inner sub-handler is NOT invoked
+# on the cached path -- a re-call is intentionally a no-op so re-running
+# the macro from a fresh session lands the same graph each time.
+# ---------------------------------------------------------------------------
+
+# Tool-version stamp embedded in every C8 Backdrop label. Bump when the
+# macro contract changes (additional sub-handler wired in, payload shape
+# change, etc.) so older auto-built blocks stay distinguishable.
+C8_TOOL_VERSION = "C8 v1"
+
+
+def _build_c8_backdrop(
+    name: str,
+    shot: str,
+    anchor_x: int,
+    anchor_y: int,
+    width: int = 280,
+    height: int = 220,
+) -> Any:
+    """Create a Backdrop labelled ``<shot> # C8 v1``.
+
+    Single utility so every C8 macro stamps the same shape: backdrop name
+    follows ``<group_name>_bd`` so callers can recover it deterministically
+    without scanning all backdrops, and the label embeds both the shot
+    code and the C8 tool version for traceability.
+    """
+    import nuke
+
+    bd = nuke.nodes.BackdropNode()
+    bd.setName(f"{name}_bd")
+    if bd.knob("label"):
+        with contextlib.suppress(Exception):
+            bd["label"].setValue(f"{shot} # {C8_TOOL_VERSION}")
+    bd.setXYpos(anchor_x - 40, anchor_y - 40)
+    if bd.knob("bdwidth"):
+        with contextlib.suppress(Exception):
+            bd["bdwidth"].setValue(width)
+    if bd.knob("bdheight"):
+        with contextlib.suppress(Exception):
+            bd["bdheight"].setValue(height)
+    return bd
+
+
+def _handle_setup_karma_aov_pipeline_ss(params: dict) -> dict:
+    """Compose ``setup_karma_aov_pipeline`` (C3) and stamp a C8 Backdrop.
+
+    The C3 handler already wraps its children in a Group; we re-use
+    that Group as the macro's wrapper and just plant a Backdrop
+    alongside with the C8 label.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"KarmaAOV_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    inner = _handle_setup_karma_aov_pipeline(
+        {
+            "read_path": params["read_path"],
+            "name": explicit_name,
+        }
+    )
+    grp = nuke.toNode(explicit_name)
+    anchor_x = grp.xpos() if grp is not None else 0
+    anchor_y = grp.ypos() if grp is not None else 0
+    bd = _build_c8_backdrop(explicit_name, shot, anchor_x, anchor_y)
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "layers": inner.get("layers", []),
+        "unknown_layers": inner.get("unknown_layers", []),
+    }
+
+
+def _handle_setup_flip_blood_comp_ss(params: dict) -> dict:
+    """Compose the C6 FLIP-blood macro and stamp a C8 Backdrop."""
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"FLIP_Blood_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    inner_params: dict[str, Any] = {
+        "beauty": params["beauty"],
+        "deep_pass": params["deep_pass"],
+        "blood_tint": params.get("blood_tint", [0.35, 0.02, 0.04]),
+        "name": explicit_name,
+    }
+    if params.get("motion") is not None:
+        inner_params["motion"] = params["motion"]
+    if params.get("holdout_roto") is not None:
+        inner_params["holdout_roto"] = params["holdout_roto"]
+    inner = _handle_setup_flip_blood_comp(inner_params)
+    grp = nuke.toNode(explicit_name)
+    anchor_x = grp.xpos() if grp is not None else 0
+    anchor_y = grp.ypos() if grp is not None else 0
+    bd = _build_c8_backdrop(explicit_name, shot, anchor_x, anchor_y)
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "write_path": params.get("write_path", ""),
+        "members": {
+            "recolor": inner.get("recolor"),
+            "holdout": inner.get("holdout"),
+            "merge": inner.get("merge"),
+            "flatten": inner.get("flatten"),
+            "grade": inner.get("grade"),
+            "vector_blur": inner.get("vector_blur"),
+            "zdefocus": inner.get("zdefocus"),
+        },
+    }
+
+
+def _handle_setup_sand_dust_layer(params: dict) -> dict:
+    """Compose the C6 deep-comp macro with a sand tint and stamp a Backdrop.
+
+    The sand/dust layer reuses the FLIP-blood pipeline shape -- deep
+    holdout + flatten + tint + optional VectorBlur -- but with a sand
+    tint default. The C6 inner handler accepts ``blood_tint`` as a
+    generic 3-tuple multiply on the Grade; we forward the sand tint
+    through it.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"SandDust_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    inner_params: dict[str, Any] = {
+        "beauty": params["beauty"],
+        "deep_pass": params["deep_pass"],
+        "blood_tint": params.get("tint", [0.78, 0.62, 0.41]),
+        "name": explicit_name,
+    }
+    if params.get("motion") is not None:
+        inner_params["motion"] = params["motion"]
+    inner = _handle_setup_flip_blood_comp(inner_params)
+    grp = nuke.toNode(explicit_name)
+    anchor_x = grp.xpos() if grp is not None else 0
+    anchor_y = grp.ypos() if grp is not None else 0
+    bd = _build_c8_backdrop(explicit_name, shot, anchor_x, anchor_y)
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "write_path": params.get("write_path", ""),
+        "members": {
+            "grade": inner.get("grade"),
+            "flatten": inner.get("flatten"),
+            "vector_blur": inner.get("vector_blur"),
+        },
+    }
+
+
+def _handle_setup_salt_structure_relight(params: dict) -> dict:
+    """Compose AOV pipeline + Relight node. Stamp a C8 Backdrop.
+
+    Composition: feed beauty + normal + position into the Relight node
+    (no additional AOV pipeline node creation -- the inner Relight
+    handler in real Nuke wires the channel inputs from the existing
+    passes). Wrap in a ``SaltRelight_<shot>`` Group with a Backdrop.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"SaltRelight_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    beauty = _resolve_node(params["beauty"])
+    if beauty is None:
+        raise ValueError(f"beauty node not found: {params['beauty']}")
+    normal = _resolve_node(params["normal_pass"])
+    if normal is None:
+        raise ValueError(f"normal_pass node not found: {params['normal_pass']}")
+    position = _resolve_node(params["position_pass"])
+    if position is None:
+        raise ValueError(f"position_pass node not found: {params['position_pass']}")
+
+    relight = nuke.nodes.Relight()
+    relight.setName(f"{explicit_name}_relight")
+    relight.setInput(0, beauty)
+    relight.setInput(1, normal)
+    relight.setInput(2, position)
+    relight.setXYpos(beauty.xpos() + 100, beauty.ypos() + 80)
+
+    light_pos = params.get("light_position", [0.0, 100.0, 0.0])
+    if relight.knob("translate"):
+        for i, v in enumerate(light_pos):
+            with contextlib.suppress(Exception):
+                relight["translate"].setValue(float(v), i)
+    light_color = params.get("light_color", [1.0, 0.92, 0.78])
+    if relight.knob("color"):
+        for i, v in enumerate(light_color):
+            with contextlib.suppress(Exception):
+                relight["color"].setValue(float(v), i)
+
+    merge = nuke.nodes.Merge2()
+    merge.setName(f"{explicit_name}_merge")
+    merge.setInput(0, beauty)
+    merge.setInput(1, relight)
+    if merge.knob("operation"):
+        with contextlib.suppress(Exception):
+            merge["operation"].setValue("over")
+    merge.setXYpos(relight.xpos(), relight.ypos() + 60)
+
+    group = nuke.nodes.Group()
+    group.setName(explicit_name)
+    group.setXYpos(beauty.xpos(), beauty.ypos() + 200)
+    bd = _build_c8_backdrop(
+        explicit_name, shot, beauty.xpos(), beauty.ypos() + 60, width=400, height=200
+    )
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "members": {
+            "relight": relight.name(),
+            "merge": merge.name(),
+        },
+    }
+
+
+def _handle_setup_dehaze_copycat_ss(params: dict) -> dict:
+    """Compose dehaze CopyCat trainer (C7) + a C8 Backdrop wrapper.
+
+    The C7 dehaze trainer is async on the wire (returns a task_id);
+    the orchestrator returns the wrapping Group + backdrop alongside
+    the task_id so the operator can poll progress while seeing where
+    the in-Nuke wiring lives.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"Dehaze_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    group = nuke.nodes.Group()
+    group.setName(explicit_name)
+    group.setXYpos(0, 0)
+    bd = _build_c8_backdrop(explicit_name, shot, 0, 0, width=320, height=160)
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "model_path": params.get("model_path", ""),
+        "epochs": params.get("epochs", 8000),
+        "haze_exemplars": list(params.get("haze_exemplars", [])),
+        "clean_exemplars": list(params.get("clean_exemplars", [])),
+    }
+
+
+def _handle_setup_smartvector_paint_propagate_ss(params: dict) -> dict:
+    """Compose SmartVector propagate (C4) + a C8 Backdrop wrapper.
+
+    The C4 SmartVector handler is async on the wire (returns a task_id).
+    The orchestrator stands up the Group + Backdrop synchronously
+    around it so the inner async handler's task_id can flow back through
+    the wrapper without blocking on the actual bake.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"PaintProp_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    plate = _resolve_node(params["plate"])
+    if plate is None:
+        raise ValueError(f"plate node not found: {params['plate']}")
+
+    group = nuke.nodes.Group()
+    group.setName(explicit_name)
+    group.setXYpos(plate.xpos(), plate.ypos() + 100)
+    bd = _build_c8_backdrop(
+        explicit_name, shot, plate.xpos(), plate.ypos() + 60, width=320, height=160
+    )
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "cache_root": params.get("cache_root", ""),
+        "paint_frame": params.get("paint_frame"),
+        "range_in": params.get("range_in"),
+        "range_out": params.get("range_out"),
+    }
+
+
+def _handle_setup_spaceship_track_patch_ss(params: dict) -> dict:
+    """Compose ``setup_spaceship_track_patch`` (C5) + stamp a C8 Backdrop.
+
+    The C5 handler already wraps its children in a Group named
+    ``SpaceshipPatch_<shot>``; we re-use that Group and stamp a Backdrop
+    next to it.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"SpaceshipPatch_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    inner_params: dict[str, Any] = {
+        "plate": params["plate"],
+        "ref_frame": int(params["ref_frame"]),
+        "surface_type": params.get("surface_type", "planar"),
+        "name": explicit_name,
+    }
+    if params.get("patch_source") is not None:
+        inner_params["patch_source"] = params["patch_source"]
+    inner = _handle_setup_spaceship_track_patch(inner_params)
+    grp = nuke.toNode(explicit_name)
+    anchor_x = grp.xpos() if grp is not None else 0
+    anchor_y = grp.ypos() if grp is not None else 0
+    bd = _build_c8_backdrop(explicit_name, shot, anchor_x, anchor_y)
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "members": inner,
+    }
+
+
+def _handle_setup_scream_shot_lensflare(params: dict) -> dict:
+    """Build the lensflare envelope. Stamp a C8 Backdrop.
+
+    Composes a Glow on the beauty highlights, a Flare driven by a
+    Position node, a Merge that lays it back over the beauty, sandwiched
+    in an ACEScct OCIOColorSpace pair (via the C2 ``convert_node_colorspace``
+    primitive). All wrapped in a ``ScreamFlare_<shot>`` Group.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    explicit_name = params.get("name") or f"ScreamFlare_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() == "Group":
+        return {
+            "group": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    beauty = _resolve_node(params["beauty"])
+    if beauty is None:
+        raise ValueError(f"beauty node not found: {params['beauty']}")
+
+    glow = nuke.nodes.Glow2()
+    glow.setName(f"{explicit_name}_glow")
+    glow.setInput(0, beauty)
+    glow.setXYpos(beauty.xpos() + 80, beauty.ypos() + 60)
+
+    flare = nuke.nodes.Flare2()
+    flare.setName(f"{explicit_name}_flare")
+    flare.setInput(0, glow)
+    flare.setXYpos(glow.xpos(), glow.ypos() + 60)
+
+    grade = nuke.nodes.Grade()
+    grade.setName(f"{explicit_name}_grade")
+    grade.setInput(0, flare)
+    intensity = float(params.get("flare_intensity", 1.6))
+    flare_color = params.get("flare_color", [1.0, 0.78, 0.55])
+    if grade.knob("multiply"):
+        for i, v in enumerate(flare_color):
+            with contextlib.suppress(Exception):
+                grade["multiply"].setValue(float(v) * intensity, i)
+    grade.setXYpos(flare.xpos(), flare.ypos() + 60)
+
+    merge = nuke.nodes.Merge2()
+    merge.setName(f"{explicit_name}_merge")
+    merge.setInput(0, beauty)
+    merge.setInput(1, grade)
+    if merge.knob("operation"):
+        with contextlib.suppress(Exception):
+            merge["operation"].setValue("plus")
+    merge.setXYpos(grade.xpos(), grade.ypos() + 60)
+
+    group = nuke.nodes.Group()
+    group.setName(explicit_name)
+    group.setXYpos(beauty.xpos(), beauty.ypos() + 240)
+    bd = _build_c8_backdrop(
+        explicit_name, shot, beauty.xpos(), beauty.ypos() + 40, width=360, height=260
+    )
+    return {
+        "group": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "members": {
+            "glow": glow.name(),
+            "flare": flare.name(),
+            "grade": grade.name(),
+            "merge": merge.name(),
+        },
+    }
+
+
+def _handle_audit_comp_for_acescct_consistency_ss(params: dict) -> dict:
+    """Run three audits (C2 colour + C9 render + C9 naming) and merge findings.
+
+    READ_ONLY composition. Each finding gets a ``source`` field
+    (``"color"`` / ``"render"`` / ``"naming"``) so the operator can
+    filter by audit origin. No graph mutation -- no Group, no Backdrop.
+    """
+    color_findings = _handle_audit_acescct_consistency({"strict": bool(params.get("strict", True))})
+    render_findings = _handle_audit_render_settings(
+        {
+            "expected_fps": float(params.get("expected_fps", 24.0)),
+            "expected_format": str(params.get("expected_format", "2048x1080")),
+        }
+    )
+    naming_findings = _handle_audit_naming_convention({"prefix": str(params.get("prefix", "ss_"))})
+
+    merged: list[dict[str, Any]] = []
+    sources: list[str] = []
+    for source_name, payload in (
+        ("color", color_findings),
+        ("render", render_findings),
+        ("naming", naming_findings),
+    ):
+        sources.append(source_name)
+        for finding in payload.get("findings", []):
+            stamped = dict(finding)
+            stamped["source"] = source_name
+            merged.append(stamped)
+
+    return {
+        "findings": merged,
+        "sources": sources,
+        "shot": params.get("shot", "unknown"),
+        "tool_version": C8_TOOL_VERSION,
+    }
+
+
+def _handle_bake_lens_distortion_envelope_ss(params: dict) -> dict:
+    """Compose ``bake_lens_distortion_envelope`` (C4) + stamp a C8 Backdrop.
+
+    The C4 handler already builds a NetworkBox (``LinearComp_undistorted_<plate>``)
+    with the head/tail STMaps. We forward the per-shot stmap_root so
+    the cached STMaps land under ``$SS/comp/stmaps/<shot>/`` and stamp
+    a separate C8 Backdrop alongside the box.
+    """
+    import nuke
+
+    shot = params.get("shot", "unknown")
+    plate_name = params["plate"]
+    explicit_name = params.get("name") or f"LinearComp_{shot}"
+    existing = nuke.toNode(explicit_name)
+    if existing is not None and existing.Class() in ("BackdropNode", "Group"):
+        return {
+            "box": explicit_name,
+            "backdrop": f"{explicit_name}_bd",
+            "shot": shot,
+            "tool_version": C8_TOOL_VERSION,
+        }
+
+    stmap_root = params.get("stmap_root", "")
+    inner_params: dict[str, Any] = {
+        "plate": plate_name,
+        "lens_solve": params["lens_solve"],
+        "stmap_paths": {
+            "undistort": (
+                f"{stmap_root}/{shot}_undistort.exr" if stmap_root else f"{shot}_undistort.exr"
+            ),
+            "redistort": (
+                f"{stmap_root}/{shot}_redistort.exr" if stmap_root else f"{shot}_redistort.exr"
+            ),
+        },
+        "name": explicit_name,
+    }
+    if params.get("write_path") is not None:
+        inner_params["write_path"] = params["write_path"]
+    inner = _handle_bake_lens_distortion_envelope(inner_params)
+
+    plate = _resolve_node(plate_name)
+    anchor_x = plate.xpos() if plate is not None else 0
+    anchor_y = plate.ypos() + 60 if plate is not None else 0
+    bd = _build_c8_backdrop(explicit_name, shot, anchor_x, anchor_y, width=400, height=300)
+    return {
+        "box": explicit_name,
+        "backdrop": bd.name(),
+        "shot": shot,
+        "tool_version": C8_TOOL_VERSION,
+        "head": inner.get("head", []),
+        "tail": inner.get("tail", []),
+        "stmap_paths": inner.get("stmap_paths", {}),
+    }
+
+
 # handler registry
 HANDLERS: dict[str, Any] = {
     "get_script_info": _handle_get_script_info,
@@ -4274,6 +4836,17 @@ HANDLERS: dict[str, Any] = {
     "audit_naming_convention": _handle_audit_naming_convention,
     "audit_render_settings": _handle_audit_render_settings,
     "qc_viewer_pair": _handle_qc_viewer_pair,
+    # C8 Salt Spill macro orchestrators (compose C2-C7 + C9 sub-handlers).
+    "setup_karma_aov_pipeline_ss": _handle_setup_karma_aov_pipeline_ss,
+    "setup_flip_blood_comp_ss": _handle_setup_flip_blood_comp_ss,
+    "setup_sand_dust_layer": _handle_setup_sand_dust_layer,
+    "setup_salt_structure_relight": _handle_setup_salt_structure_relight,
+    "setup_dehaze_copycat_ss": _handle_setup_dehaze_copycat_ss,
+    "setup_smartvector_paint_propagate_ss": _handle_setup_smartvector_paint_propagate_ss,
+    "setup_spaceship_track_patch_ss": _handle_setup_spaceship_track_patch_ss,
+    "setup_scream_shot_lensflare": _handle_setup_scream_shot_lensflare,
+    "audit_comp_for_acescct_consistency_ss": _handle_audit_comp_for_acescct_consistency_ss,
+    "bake_lens_distortion_envelope_ss": _handle_bake_lens_distortion_envelope_ss,
 }
 
 

@@ -38,6 +38,7 @@ from nuke_mcp.tools import (
     read,
     render,
     roto,
+    salt_spill,
     script,
     tasks,
     track_workflow,
@@ -103,6 +104,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     deep_workflow.register(ctx)
     ml.register(ctx)
     audit.register(ctx)
+    salt_spill.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 

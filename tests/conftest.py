@@ -1021,6 +1021,17 @@ class MockNukeServer:
             "audit_naming_convention": self._audit_naming_convention,
             "audit_render_settings": self._audit_render_settings,
             "qc_viewer_pair": self._qc_viewer_pair,
+            # C8 Salt Spill macro orchestrators (compose C2-C7 + C9 sub-handlers)
+            "setup_karma_aov_pipeline_ss": self._setup_karma_aov_pipeline_ss,
+            "setup_flip_blood_comp_ss": self._setup_flip_blood_comp_ss,
+            "setup_sand_dust_layer": self._setup_sand_dust_layer,
+            "setup_salt_structure_relight": self._setup_salt_structure_relight,
+            "setup_dehaze_copycat_ss": self._setup_dehaze_copycat_ss,
+            "setup_smartvector_paint_propagate_ss": self._setup_smartvector_paint_propagate_ss,
+            "setup_spaceship_track_patch_ss": self._setup_spaceship_track_patch_ss,
+            "setup_scream_shot_lensflare": self._setup_scream_shot_lensflare,
+            "audit_comp_for_acescct_consistency_ss": (self._audit_comp_for_acescct_consistency_ss),
+            "bake_lens_distortion_envelope_ss": self._bake_lens_distortion_envelope_ss,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -3120,6 +3131,395 @@ class MockNukeServer:
             "Switch", None, "Switch1", [beauty, recombined, grade_name]
         )
         return self._node_ref_from_state(switch_name)
+
+    # ------------------------------------------------------------------
+    # C8 Salt Spill macro orchestrators.
+    #
+    # Each ``_setup_..._ss`` mock mirrors the addon-side handler:
+    # appends its own typed_calls entry, calls the relevant inner
+    # mock sub-handler so the wire log records the composition,
+    # creates a Group + a Backdrop labelled with the shot code +
+    # tool version, and returns the wrapping payload. Each is
+    # idempotent on ``name=`` -- a second call with the same name
+    # returns the cached payload without re-invoking the inner
+    # sub-handler.
+    # ------------------------------------------------------------------
+
+    _C8_TOOL_VERSION = "C8 v1"
+
+    def _c8_make_backdrop(self, group_name: str, shot: str) -> str:
+        """Register a BackdropNode whose label embeds shot + tool version."""
+        bd_name = f"{group_name}_bd"
+        self.nodes[bd_name] = {
+            "type": "BackdropNode",
+            "knobs": {
+                "label": f"{shot} # {self._C8_TOOL_VERSION}",
+                "group": group_name,
+            },
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[bd_name] = []
+        return bd_name
+
+    def _c8_existing_group(self, name: str) -> dict | None:
+        """Return cached idempotent payload if a Group with ``name`` exists."""
+        if name not in self.nodes:
+            return None
+        existing = self.nodes[name]
+        if existing["type"] not in ("Group", "BackdropNode"):
+            return None
+        return {
+            "group": name,
+            "backdrop": f"{name}_bd",
+            "shot": existing.get("knobs", {}).get("shot", "unknown"),
+            "tool_version": self._C8_TOOL_VERSION,
+        }
+
+    def _setup_karma_aov_pipeline_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_karma_aov_pipeline_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"KarmaAOV_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        inner = self._setup_karma_aov_pipeline(
+            {
+                "read_path": p["read_path"],
+                "name": explicit_name,
+            }
+        )
+        # Stamp the shot on the Group so the cached re-call can recover it.
+        self.nodes[explicit_name].setdefault("knobs", {})["shot"] = shot
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "layers": inner.get("layers", []),
+            "unknown_layers": inner.get("unknown_layers", []),
+        }
+
+    def _setup_flip_blood_comp_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_flip_blood_comp_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"FLIP_Blood_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        inner_params = {
+            "beauty": p["beauty"],
+            "deep_pass": p["deep_pass"],
+            "blood_tint": p.get("blood_tint", [0.35, 0.02, 0.04]),
+            "name": explicit_name,
+        }
+        if p.get("motion") is not None:
+            inner_params["motion"] = p["motion"]
+        if p.get("holdout_roto") is not None:
+            inner_params["holdout_roto"] = p["holdout_roto"]
+        inner = self._setup_flip_blood_comp(inner_params)
+        self.nodes[explicit_name].setdefault("knobs", {})["shot"] = shot
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "write_path": p.get("write_path", ""),
+            "members": {
+                "recolor": inner.get("recolor"),
+                "holdout": inner.get("holdout"),
+                "merge": inner.get("merge"),
+                "flatten": inner.get("flatten"),
+                "grade": inner.get("grade"),
+                "vector_blur": inner.get("vector_blur"),
+                "zdefocus": inner.get("zdefocus"),
+            },
+        }
+
+    def _setup_sand_dust_layer(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_sand_dust_layer", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"SandDust_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        inner_params = {
+            "beauty": p["beauty"],
+            "deep_pass": p["deep_pass"],
+            "blood_tint": p.get("tint", [0.78, 0.62, 0.41]),
+            "name": explicit_name,
+        }
+        if p.get("motion") is not None:
+            inner_params["motion"] = p["motion"]
+        inner = self._setup_flip_blood_comp(inner_params)
+        self.nodes[explicit_name].setdefault("knobs", {})["shot"] = shot
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "write_path": p.get("write_path", ""),
+            "members": {
+                "grade": inner.get("grade"),
+                "flatten": inner.get("flatten"),
+                "vector_blur": inner.get("vector_blur"),
+            },
+        }
+
+    def _setup_salt_structure_relight(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_salt_structure_relight", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"SaltRelight_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        beauty = p["beauty"]
+        normal = p["normal_pass"]
+        position = p["position_pass"]
+        for label, n in (("beauty", beauty), ("normal_pass", normal), ("position_pass", position)):
+            if n not in self.nodes:
+                raise ValueError(f"{label} node not found: {n}")
+        relight_name = self._register_node(
+            "Relight",
+            f"{explicit_name}_relight",
+            "Relight1",
+            [beauty, normal, position],
+            knobs={
+                "translate": list(p.get("light_position", [0.0, 100.0, 0.0])),
+                "color": list(p.get("light_color", [1.0, 0.92, 0.78])),
+            },
+        )
+        merge_name = self._register_node(
+            "Merge2",
+            f"{explicit_name}_merge",
+            "Merge1",
+            [beauty, relight_name],
+            knobs={"operation": "over"},
+        )
+        self._register_node(
+            "Group",
+            explicit_name,
+            explicit_name,
+            [],
+            knobs={"shot": shot},
+        )
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "members": {
+                "relight": relight_name,
+                "merge": merge_name,
+            },
+        }
+
+    def _setup_dehaze_copycat_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_dehaze_copycat_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"Dehaze_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        self._register_node(
+            "Group",
+            explicit_name,
+            explicit_name,
+            [],
+            knobs={"shot": shot},
+        )
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "model_path": p.get("model_path", ""),
+            "epochs": p.get("epochs", 8000),
+            "haze_exemplars": list(p.get("haze_exemplars", [])),
+            "clean_exemplars": list(p.get("clean_exemplars", [])),
+        }
+
+    def _setup_smartvector_paint_propagate_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_smartvector_paint_propagate_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"PaintProp_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        plate = p["plate"]
+        if plate not in self.nodes:
+            raise ValueError(f"plate node not found: {plate}")
+        self._register_node(
+            "Group",
+            explicit_name,
+            explicit_name,
+            [],
+            knobs={"shot": shot},
+        )
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "cache_root": p.get("cache_root", ""),
+            "paint_frame": p.get("paint_frame"),
+            "range_in": p.get("range_in"),
+            "range_out": p.get("range_out"),
+        }
+
+    def _setup_spaceship_track_patch_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_spaceship_track_patch_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"SpaceshipPatch_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        inner_params = {
+            "plate": p["plate"],
+            "ref_frame": int(p["ref_frame"]),
+            "surface_type": p.get("surface_type", "planar"),
+            "name": explicit_name,
+        }
+        if p.get("patch_source") is not None:
+            inner_params["patch_source"] = p["patch_source"]
+        inner = self._setup_spaceship_track_patch(inner_params)
+        self.nodes[explicit_name].setdefault("knobs", {})["shot"] = shot
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "members": inner,
+        }
+
+    def _setup_scream_shot_lensflare(self, p: dict) -> dict:
+        self.typed_calls.append(("setup_scream_shot_lensflare", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"ScreamFlare_{shot}"
+        cached = self._c8_existing_group(explicit_name)
+        if cached is not None:
+            return cached
+        beauty = p["beauty"]
+        if beauty not in self.nodes:
+            raise ValueError(f"beauty node not found: {beauty}")
+        intensity = float(p.get("flare_intensity", 1.6))
+        flare_color = list(p.get("flare_color", [1.0, 0.78, 0.55]))
+        glow_name = self._register_node("Glow2", f"{explicit_name}_glow", "Glow2_1", [beauty])
+        flare_name = self._register_node(
+            "Flare2", f"{explicit_name}_flare", "Flare2_1", [glow_name]
+        )
+        grade_name = self._register_node(
+            "Grade",
+            f"{explicit_name}_grade",
+            "Grade1",
+            [flare_name],
+            knobs={"multiply": [v * intensity for v in flare_color]},
+        )
+        merge_name = self._register_node(
+            "Merge2",
+            f"{explicit_name}_merge",
+            "Merge1",
+            [beauty, grade_name],
+            knobs={"operation": "plus"},
+        )
+        self._register_node(
+            "Group",
+            explicit_name,
+            explicit_name,
+            [],
+            knobs={"shot": shot},
+        )
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "group": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "members": {
+                "glow": glow_name,
+                "flare": flare_name,
+                "grade": grade_name,
+                "merge": merge_name,
+            },
+        }
+
+    def _audit_comp_for_acescct_consistency_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("audit_comp_for_acescct_consistency_ss", dict(p)))
+        color = self._audit_acescct_consistency({"strict": bool(p.get("strict", True))})
+        render = self._audit_render_settings(
+            {
+                "expected_fps": float(p.get("expected_fps", 24.0)),
+                "expected_format": str(p.get("expected_format", "2048x1080")),
+            }
+        )
+        naming = self._audit_naming_convention({"prefix": str(p.get("prefix", "ss_"))})
+        merged: list[dict] = []
+        sources: list[str] = []
+        for source_name, payload in (
+            ("color", color),
+            ("render", render),
+            ("naming", naming),
+        ):
+            sources.append(source_name)
+            for finding in payload.get("findings", []):
+                stamped = dict(finding)
+                stamped["source"] = source_name
+                merged.append(stamped)
+        return {
+            "findings": merged,
+            "sources": sources,
+            "shot": p.get("shot", "unknown"),
+            "tool_version": self._C8_TOOL_VERSION,
+        }
+
+    def _bake_lens_distortion_envelope_ss(self, p: dict) -> dict:
+        self.typed_calls.append(("bake_lens_distortion_envelope_ss", dict(p)))
+        shot = p.get("shot", "unknown")
+        explicit_name = p.get("name") or f"LinearComp_{shot}"
+        if explicit_name in self.nodes:
+            existing = self.nodes[explicit_name]
+            if existing["type"] in ("BackdropNode", "Group"):
+                return {
+                    "box": explicit_name,
+                    "backdrop": f"{explicit_name}_bd",
+                    "shot": shot,
+                    "tool_version": self._C8_TOOL_VERSION,
+                }
+        stmap_root = p.get("stmap_root", "")
+        inner_params = {
+            "plate": p["plate"],
+            "lens_solve": p["lens_solve"],
+            "stmap_paths": {
+                "undistort": (
+                    f"{stmap_root}/{shot}_undistort.exr" if stmap_root else f"{shot}_undistort.exr"
+                ),
+                "redistort": (
+                    f"{stmap_root}/{shot}_redistort.exr" if stmap_root else f"{shot}_redistort.exr"
+                ),
+            },
+            "name": explicit_name,
+        }
+        if p.get("write_path") is not None:
+            inner_params["write_path"] = p["write_path"]
+        inner = self._bake_lens_distortion_envelope(inner_params)
+        self.nodes[explicit_name].setdefault("knobs", {})["shot"] = shot
+        bd = self._c8_make_backdrop(explicit_name, shot)
+        return {
+            "box": explicit_name,
+            "backdrop": bd,
+            "shot": shot,
+            "tool_version": self._C8_TOOL_VERSION,
+            "head": inner.get("head", []),
+            "tail": inner.get("tail", []),
+            "stmap_paths": inner.get("stmap_paths", {}),
+        }
 
 
 @pytest.fixture(autouse=True)

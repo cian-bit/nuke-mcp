@@ -156,6 +156,19 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "setup_dehaze_copycat": BENIGN_NEW,
     "list_cattery_models": READ_ONLY,
     "install_cattery_model": BENIGN_NEW,
+    # salt_spill.py (C8 -- 10 flag-planters that compose C2-C7 + C9
+    # primitives). Nine builders are ``BENIGN_NEW`` (each plants new
+    # nodes, never destroys); the audit composition is ``READ_ONLY``.
+    "setup_karma_aov_pipeline_ss": BENIGN_NEW,
+    "setup_flip_blood_comp_ss": BENIGN_NEW,
+    "setup_sand_dust_layer": BENIGN_NEW,
+    "setup_salt_structure_relight": BENIGN_NEW,
+    "setup_dehaze_copycat_ss": BENIGN_NEW,
+    "setup_smartvector_paint_propagate_ss": BENIGN_NEW,
+    "setup_spaceship_track_patch_ss": BENIGN_NEW,
+    "setup_scream_shot_lensflare": BENIGN_NEW,
+    "audit_comp_for_acescct_consistency_ss": READ_ONLY,
+    "bake_lens_distortion_envelope_ss": BENIGN_NEW,
 }
 
 
