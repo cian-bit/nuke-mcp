@@ -119,6 +119,14 @@ EXPECTED_HINTS: dict[str, dict[str, bool]] = {
     "audit_acescct_consistency": READ_ONLY,
     "convert_node_colorspace": BENIGN_NEW,
     "create_ocio_colorspace": BENIGN_NEW,
+    # distortion.py (C4) -- the two async tools also stamp BENIGN_NEW.
+    # The Task-wrapped path returns ``{task_id}`` immediately rather
+    # than a finished render, but creating the underlying SmartVector
+    # / STMap nodes is still a non-destructive new-state operation.
+    "bake_lens_distortion_envelope": BENIGN_NEW,
+    "apply_idistort": BENIGN_NEW,
+    "apply_smartvector_propagate": BENIGN_NEW,
+    "generate_stmap": BENIGN_NEW,
     # profiles.py (B4) -- runtime profile loading. ``list_profiles``
     # is a pure read; load/unload mutate the visible tool surface but
     # nothing in the Nuke session, hence ``BENIGN_NEW``-shape stamps.

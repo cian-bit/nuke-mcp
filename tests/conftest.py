@@ -819,6 +819,11 @@ class MockNukeServer:
         # mock server's internal threading.
         self.async_renders: list[dict] = []
         self.cancelled_renders: list[str | None] = []
+        # C4 async distortion tasks (SmartVector + STMap). Same shape as
+        # ``async_renders`` -- one list per kind so tests can assert
+        # routing without parsing the cmd back out of a shared log.
+        self.async_smartvectors: list[dict] = []
+        self.async_stmaps: list[dict] = []
         self.script_info = {
             "script": "/tmp/test.nk",
             "first_frame": 1001,
@@ -979,6 +984,14 @@ class MockNukeServer:
             "detect_aov_layers": self._detect_aov_layers,
             "setup_karma_aov_pipeline": self._setup_karma_aov_pipeline,
             "setup_aov_merge": self._setup_aov_merge,
+            # C4 distortion: typed sync handlers + async starters.
+            # Async starters return the immediate {task_id, started}
+            # ack; tests inject task_progress notifications via the
+            # notification queue to drive the MCP-side listener.
+            "bake_lens_distortion_envelope": self._bake_lens_distortion_envelope,
+            "apply_idistort": self._apply_idistort,
+            "apply_smartvector_propagate_async": self._apply_smartvector_propagate_async,
+            "generate_stmap_async": self._generate_stmap_async,
         }.get(cmd)
 
         resp: dict[str, Any]
@@ -2302,6 +2315,128 @@ class MockNukeServer:
             "final": merges[-1] if merges else None,
             "inputs": list(raw_names),
         }
+
+    # ------------------------------------------------------------------
+    # C4 distortion handlers
+    # ------------------------------------------------------------------
+
+    def _bake_lens_distortion_envelope(self, p: dict) -> dict:
+        self.typed_calls.append(("bake_lens_distortion_envelope", dict(p)))
+        plate = p["plate"]
+        lens_solve = p["lens_solve"]
+        stmap_paths = p.get("stmap_paths") or {}
+        explicit_name = p.get("name")
+        box_name = explicit_name or f"LinearComp_undistorted_{plate}"
+        if plate not in self.nodes:
+            raise ValueError(f"plate node not found: {plate}")
+        if lens_solve not in self.nodes:
+            raise ValueError(f"lens_solve node not found: {lens_solve}")
+
+        # Idempotent: if the box already exists, return its cached
+        # head/tail dict without re-creating the four body nodes.
+        if box_name in self.nodes:
+            existing = self.nodes[box_name]
+            if existing["type"] != "BackdropNode":
+                raise ValueError(
+                    f"node '{box_name}' exists but is class '{existing['type']}', "
+                    "expected BackdropNode"
+                )
+            return {
+                "box": box_name,
+                "head": [
+                    f"{box_name}_head_lensdistortion",
+                    f"{box_name}_head_stmap",
+                ],
+                "tail": [
+                    f"{box_name}_tail_stmap",
+                    f"{box_name}_write",
+                ],
+                "stmap_paths": stmap_paths,
+            }
+
+        head_ld = f"{box_name}_head_lensdistortion"
+        head_stmap = f"{box_name}_head_stmap"
+        tail_stmap = f"{box_name}_tail_stmap"
+        write = f"{box_name}_write"
+        self.nodes[head_ld] = {"type": "LensDistortion", "knobs": {}, "x": 0, "y": 0}
+        self.connections[head_ld] = [plate]
+        self.nodes[head_stmap] = {
+            "type": "STMap",
+            "knobs": {"file": stmap_paths.get("undistort", "")},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[head_stmap] = [head_ld]
+        self.nodes[tail_stmap] = {
+            "type": "STMap",
+            "knobs": {"file": stmap_paths.get("redistort", "")},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[tail_stmap] = [head_stmap]
+        self.nodes[write] = {
+            "type": "Write",
+            "knobs": {"file": p.get("write_path", "")},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[write] = [tail_stmap]
+        self.nodes[box_name] = {
+            "type": "BackdropNode",
+            "knobs": {"label": box_name},
+            "x": 0,
+            "y": 0,
+        }
+        self.connections[box_name] = []
+        return {
+            "box": box_name,
+            "head": [head_ld, head_stmap],
+            "tail": [tail_stmap, write],
+            "stmap_paths": stmap_paths,
+        }
+
+    def _apply_idistort(self, p: dict) -> dict:
+        self.typed_calls.append(("apply_idistort", dict(p)))
+        plate = p["plate"]
+        vector = p["vector_node"]
+        u_channel = p.get("u_channel", "forward.u")
+        v_channel = p.get("v_channel", "forward.v")
+        name = p.get("name")
+        if plate not in self.nodes:
+            raise ValueError(f"plate not found: {plate}")
+        if vector not in self.nodes:
+            raise ValueError(f"vector_node not found: {vector}")
+        expected_inputs = [plate, vector]
+        cached = self._try_idempotent(name, "IDistort", expected_inputs)
+        if cached is not None:
+            cached["u_channel"] = u_channel
+            cached["v_channel"] = v_channel
+            return cached
+        new_name = self._register_node(
+            "IDistort",
+            name,
+            "IDistort1",
+            expected_inputs,
+            knobs={
+                "channelsX": u_channel,
+                "channelsY": v_channel,
+            },
+        )
+        out = self._node_ref_from_state(new_name)
+        out["u_channel"] = u_channel
+        out["v_channel"] = v_channel
+        return out
+
+    def _apply_smartvector_propagate_async(self, p: dict) -> dict:
+        # Mock: record the call so tests can assert the wire payload
+        # and return the immediate ack. Tests inject task_progress
+        # notifications themselves via the notification queue.
+        self.async_smartvectors.append(p)
+        return {"task_id": p.get("task_id"), "started": True}
+
+    def _generate_stmap_async(self, p: dict) -> dict:
+        self.async_stmaps.append(p)
+        return {"task_id": p.get("task_id"), "started": True}
 
 
 @pytest.fixture(autouse=True)

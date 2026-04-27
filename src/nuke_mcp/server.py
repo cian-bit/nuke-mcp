@@ -27,6 +27,7 @@ from nuke_mcp.tools import (
     comp,
     deep,
     digest,
+    distortion,
     expressions,
     graph,
     knobs,
@@ -92,6 +93,7 @@ def register_tools(ctx: ServerContext, active_profiles: Iterable[str] | None = N
     deep.register(ctx)
     color.register(ctx)
     aov.register(ctx)
+    distortion.register(ctx)
     tasks.register(ctx)
     profiles_tools.register(ctx)
 
