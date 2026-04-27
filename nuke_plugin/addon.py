@@ -14,13 +14,30 @@ silently return None. This is the bug in kleer001's implementation.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 import os
+import pathlib
 import socket
 import threading
 import traceback
 from typing import Any
+
+# A5: crash watchdog. addon.py is loaded two ways:
+#   * Inside Nuke as ``nuke_mcp_addon.addon`` (a real package).
+#   * Inside tests via ``spec_from_file_location`` with no parent
+#     package, so ``from . import _watchdog`` fails.
+# Try the package import first; fall back to a sibling-file load so the
+# same module instance is shared across both load paths.
+try:
+    from . import _watchdog  # type: ignore[no-redef]
+except ImportError:
+    _wd_path = pathlib.Path(__file__).with_name("_watchdog.py")
+    _wd_spec = importlib.util.spec_from_file_location("nuke_mcp_addon._watchdog", _wd_path)
+    assert _wd_spec is not None and _wd_spec.loader is not None
+    _watchdog = importlib.util.module_from_spec(_wd_spec)
+    _wd_spec.loader.exec_module(_watchdog)
 
 log = logging.getLogger("nuke_mcp.addon")
 
@@ -230,6 +247,7 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
         resp = {"status": "ok", "result": result}
         if rid is not None:
             resp["_request_id"] = rid
+        _watchdog.record_success()
         return resp
     except Exception as e:
         resp = {
@@ -240,6 +258,7 @@ def _dispatch(msg: dict[str, Any]) -> dict[str, Any]:
         }
         if rid is not None:
             resp["_request_id"] = rid
+        _watchdog.record_failure(cmd, rid, e)
         return resp
     finally:
         _request_local.node_cache = None
