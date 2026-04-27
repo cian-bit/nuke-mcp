@@ -86,8 +86,8 @@ def test_request_id_round_trips(connected):
     server._dispatch = capture_dispatch
     connection.send("get_script_info")
     assert len(seen) == 1
-    # 8 hex chars from uuid4().hex[:8]
-    assert len(seen[0]) == 8
+    # 16 hex chars from uuid4().hex[:16] -- 64 bits, collision-safe
+    assert len(seen[0]) == 16
     assert all(c in "0123456789abcdef" for c in seen[0])
 
 
@@ -175,7 +175,7 @@ def test_command_error_envelope(connected):
         assert "request_id" in env
         assert isinstance(env["duration_ms"], int)
         assert env["duration_ms"] >= 0
-        assert len(env["request_id"]) == 8
+        assert len(env["request_id"]) == 16
     else:
         pytest.fail("expected CommandError")
 
@@ -380,4 +380,4 @@ def test_helpers_decorator_formats_envelope(connected):
     assert out["error_class"] == "CommandError"
     assert "duration_ms" in out
     assert "request_id" in out
-    assert len(out["request_id"]) == 8
+    assert len(out["request_id"]) == 16

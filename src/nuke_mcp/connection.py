@@ -307,8 +307,8 @@ def send(command: str, *, _class: str = "read", **params: Any) -> dict[str, Any]
         **params: forwarded as the ``params`` dict in the wire payload.
 
     Auto-reconnects once on send failure. Adds a request_id (uuid4
-    hex[:8]) at the payload root; the addon echoes it back and a
-    mismatch raises ConnectionError.
+    hex[:16] = 64 bits, collision-safe at session scale) at the payload
+    root; the addon echoes it back and a mismatch raises ConnectionError.
     """
     global _sock, _session_lost
 
@@ -318,7 +318,7 @@ def send(command: str, *, _class: str = "read", **params: Any) -> dict[str, Any]
 
     timeout = TIMEOUT_CLASSES.get(_class, TIMEOUT_CLASSES["read"])
 
-    rid = uuid.uuid4().hex[:8]
+    rid = uuid.uuid4().hex[:16]
     msg = {"type": command, "params": params, "_request_id": rid}
 
     started = time.perf_counter()
@@ -394,7 +394,7 @@ def send_raw(command: str, timeout: float | None = None, **params: Any) -> dict[
         if abs(value - timeout) < 1e-6:
             return send(command, _class=name, **params)
     # custom timeout: piggyback on the socket-level override path
-    msg = {"type": command, "params": params, "_request_id": uuid.uuid4().hex[:8]}
+    msg = {"type": command, "params": params, "_request_id": uuid.uuid4().hex[:16]}
     resp = _io_round_trip(msg, timeout)
     if resp.get("status") == "error":
         raise CommandError(resp.get("error", "unknown error"))

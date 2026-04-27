@@ -523,3 +523,182 @@ def test_attr_path_subscript_root_returns_none() -> None:
     tree = ast.parse("x[0].bar")
     expr = tree.body[0].value  # type: ignore[attr-defined]
     assert _attr_path(expr) is None
+
+
+# ---------------------------------------------------------------------
+# Extended alias resolution (GPT-5.5 finding #1)
+# ---------------------------------------------------------------------
+
+
+def test_alias_via_sys_modules_subscript_call() -> None:
+    """``sys.modules['nuke'].scriptClose()`` must be flagged."""
+    code = 'import sys\nsys.modules["nuke"].scriptClose()'
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+    assert any("scriptClose" in m for m in _error_messages(findings))
+
+
+def test_alias_via_globals_subscript_call() -> None:
+    """``globals()['nuke'].scriptClose()`` must be flagged."""
+    code = 'globals()["nuke"].scriptClose()'
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+    assert any("scriptClose" in m for m in _error_messages(findings))
+
+
+def test_alias_via_vars_subscript() -> None:
+    """``vars(nuke)['scriptClose']()`` -- bound to a name then called."""
+    code = 'fn = vars(nuke)["scriptClose"]\nfn()'
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+    assert any("scriptClose" in m for m in _error_messages(findings))
+
+
+def test_alias_walrus_target() -> None:
+    """``(fn := nuke.scriptClose)()`` must taint ``fn``."""
+    code = "(fn := nuke.scriptClose)\nfn()"
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+
+
+def test_alias_import_as_module_rewrite() -> None:
+    """``import nuke as N; N.scriptClose()`` should resolve through to nuke."""
+    code = "import nuke as N\nN.scriptClose()"
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+    assert any("scriptClose" in m for m in _error_messages(findings))
+
+
+def test_alias_import_os_as_other_then_remove() -> None:
+    """``import os as O; O.remove(...)`` must catch the remove call."""
+    code = 'import os as O\nO.remove("foo")'
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+    assert any("os.remove" in m for m in _error_messages(findings))
+
+
+def test_alias_dangerous_returner_function() -> None:
+    """A function whose body returns ``nuke.scriptClose`` taints calls."""
+    code = """
+def evil():
+    return nuke.scriptClose
+
+evil()()
+"""
+    findings = _detect_dangerous_code(code)
+    # Calling the returner alone marks the name dangerous; the result
+    # is then called separately. We just assert the scan flagged the
+    # function name as a tainted alias.
+    assert _has_error(findings)
+
+
+def test_alias_nfkc_fullwidth_attr_path() -> None:
+    """NFKC normalises attribute names so fullwidth-Latin payloads
+    (e.g. ``nuke.ｓｃｒｉｐｔClose()``) collapse onto the ASCII forms.
+
+    Python's parser also performs NFKC, so the test is a defence-in-
+    depth check: even if a future hand-rolled tokeniser keeps a literal
+    fullwidth name, our match path normalises before lookup.
+    """
+    code = "nuke.ｓｃｒｉｐｔClose()"
+    findings = _detect_dangerous_code(code)
+    assert _has_error(findings)
+
+
+def test_alias_normalize_helper_collapses_fullwidth() -> None:
+    """Direct check on the NFKC helper -- guards against regressions if
+    the parser ever stops normalising for us.
+    """
+    from nuke_mcp.tools._safety import _normalize
+
+    assert _normalize("ｓｃｒｉｐｔClose") == "scriptClose"
+
+
+# ---------------------------------------------------------------------
+# AST-based open() detection (GPT-5.5 finding #2)
+# ---------------------------------------------------------------------
+
+
+def test_open_single_arg_is_not_a_write() -> None:
+    """``open("foo")`` is a read-mode default and must NOT trigger.
+
+    Regression: the old regex falsely flagged this because the path
+    happens to contain mode-letter characters.
+    """
+    findings = _detect_dangerous_code('open("foo")')
+    assert not _has_error(findings)
+
+
+def test_open_path_with_mode_letters_is_not_a_write() -> None:
+    """``open("a")`` was a regex false-positive (path letter == mode "a")."""
+    findings = _detect_dangerous_code('open("a")')
+    assert not _has_error(findings)
+
+
+def test_open_explicit_read_mode_ok() -> None:
+    findings = _detect_dangerous_code('open("foo", "r")')
+    assert not _has_error(findings)
+
+
+def test_open_read_plus_mode_blocked() -> None:
+    """``open("foo", "r+")`` opens in read-write -- must be blocked."""
+    findings = _detect_dangerous_code('open("foo", "r+")')
+    assert _has_error(findings)
+
+
+def test_open_mode_keyword_argument_blocked() -> None:
+    """``open("foo", mode="w")`` must be detected via the mode= kwarg."""
+    findings = _detect_dangerous_code('open("foo", mode="w")')
+    assert _has_error(findings)
+
+
+def test_open_mode_keyword_read_ok() -> None:
+    findings = _detect_dangerous_code('open("foo", mode="r")')
+    assert not _has_error(findings)
+
+
+def test_open_attribute_form_writes_blocked() -> None:
+    """``builtins.open(p, "w")`` and ``io.open(p, "w")`` must be blocked."""
+    findings = _detect_dangerous_code('import builtins\nbuiltins.open("foo", "w")')
+    assert _has_error(findings)
+
+
+def test_open_dynamic_mode_passes() -> None:
+    """A non-literal mode (variable) is treated as unknown -- not flagged.
+
+    The regex backstop only fires on SyntaxError fallback.
+    """
+    code = 'm = "r"\nopen("foo", m)'
+    findings = _detect_dangerous_code(code)
+    assert not _has_error(findings)
+
+
+def test_open_syntax_error_with_write_mode_still_flags() -> None:
+    """SyntaxError fallback still uses the regex backstop for mode strings."""
+    findings = _detect_dangerous_code('def broken(:\n    open("foo","w")')
+    assert _has_error(findings)
+
+
+# ---------------------------------------------------------------------
+# Module-aliases helper
+# ---------------------------------------------------------------------
+
+
+def test_collect_module_aliases_handles_plain_import() -> None:
+    import ast
+
+    from nuke_mcp.tools._safety import _collect_module_aliases
+
+    tree = ast.parse("import nuke")
+    mapping = _collect_module_aliases(tree)
+    assert mapping.get("nuke") == "nuke"
+
+
+def test_collect_module_aliases_handles_import_as() -> None:
+    import ast
+
+    from nuke_mcp.tools._safety import _collect_module_aliases
+
+    tree = ast.parse("import nuke as N")
+    mapping = _collect_module_aliases(tree)
+    assert mapping.get("N") == "nuke"
