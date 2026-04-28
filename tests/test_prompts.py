@@ -21,6 +21,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import tomllib
 from fastmcp import Client, FastMCP
 
 from nuke_mcp.prompts import (
@@ -70,6 +71,12 @@ def test_every_spec_has_description_and_body() -> None:
         # Reasonable lower bound -- workflow prompts are multi-step
         # walkthroughs, not one-liners.
         assert len(spec.body) > 500, f"{spec.name} body too short: {len(spec.body)}"
+
+
+def test_pyproject_packages_prompt_markdown_files() -> None:
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert data["tool"]["setuptools"]["package-data"]["nuke_mcp"] == ["prompts/*.md"]
 
 
 def test_frontmatter_parses_arguments_with_required_flag() -> None:

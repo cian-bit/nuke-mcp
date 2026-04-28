@@ -14,6 +14,7 @@ file may trigger a real training run.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -462,6 +463,35 @@ def test_install_cattery_model_cancellation(ml_tools_with_taskstore):
     # The render-cancel dispatch must NOT have fired.
     assert task_id not in server.cancelled_renders
     assert task_id not in server.cancelled_copycats
+
+
+def test_real_addon_registers_c7_async_and_cancel_handlers():
+    import conftest
+
+    addon = conftest._addon_module
+    for command in (
+        "train_copycat_async",
+        "setup_dehaze_copycat_async",
+        "install_cattery_model_async",
+    ):
+        assert command in addon.ASYNC_HANDLERS
+
+    for command, registry, lock in (
+        ("cancel_copycat", addon._active_copycat_tasks, addon._active_copycat_tasks_guard),
+        ("cancel_install", addon._active_install_tasks, addon._active_install_tasks_guard),
+    ):
+        task_id = f"{command}_task"
+        stop = threading.Event()
+        with lock:
+            registry[task_id] = stop
+        try:
+            response = addon._dispatch({"type": command, "params": {"task_id": task_id}})
+            assert response["status"] == "ok"
+            assert response["result"] == {"cancelled": True, "task_id": task_id}
+            assert stop.is_set()
+        finally:
+            with lock:
+                registry.pop(task_id, None)
 
 
 # ---------------------------------------------------------------------------
