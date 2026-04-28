@@ -235,8 +235,6 @@ def _dispatch(msg: dict[str, Any], client: socket.socket | None = None) -> dict[
     return a task_id immediately and let a background worker emit
     ``task_progress`` lines on the same socket.
     """
-    import nuke
-
     cmd = msg.get("type", "")
     params = msg.get("params", {})
     rid = msg.get("_request_id")
@@ -287,6 +285,22 @@ def _dispatch(msg: dict[str, Any], client: socket.socket | None = None) -> dict[
             resp["_request_id"] = rid
         return resp
 
+    if cmd == "cancel_copycat":
+        task_id = params.get("task_id")
+        cancelled = bool(task_id) and _cancel_copycat_task(str(task_id))
+        resp = {"status": "ok", "result": {"cancelled": cancelled, "task_id": task_id}}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
+
+    if cmd == "cancel_install":
+        task_id = params.get("task_id")
+        cancelled = bool(task_id) and _cancel_install_task(str(task_id))
+        resp = {"status": "ok", "result": {"cancelled": cancelled, "task_id": task_id}}
+        if rid is not None:
+            resp["_request_id"] = rid
+        return resp
+
     # build the code string to execute on the main thread
     handler = HANDLERS.get(cmd)
     if handler is None:
@@ -297,6 +311,8 @@ def _dispatch(msg: dict[str, Any], client: socket.socket | None = None) -> dict[
 
     _request_local.node_cache = {}
     try:
+        import nuke
+
         result = nuke.executeInMainThreadWithResult(handler, args=(params,))
         resp = {"status": "ok", "result": result}
         if rid is not None:
@@ -406,6 +422,54 @@ def _cancel_active_render(task_id: str) -> bool:
             stop.set()
             return True
     return False
+
+
+_active_copycat_tasks: dict[str, threading.Event] = {}
+_active_copycat_tasks_guard = threading.Lock()
+_active_install_tasks: dict[str, threading.Event] = {}
+_active_install_tasks_guard = threading.Lock()
+
+
+def _register_copycat_task(task_id: str) -> threading.Event:
+    stop = threading.Event()
+    with _active_copycat_tasks_guard:
+        _active_copycat_tasks[task_id] = stop
+    return stop
+
+
+def _unregister_copycat_task(task_id: str) -> None:
+    with _active_copycat_tasks_guard:
+        _active_copycat_tasks.pop(task_id, None)
+
+
+def _register_install_task(task_id: str) -> threading.Event:
+    stop = threading.Event()
+    with _active_install_tasks_guard:
+        _active_install_tasks[task_id] = stop
+    return stop
+
+
+def _unregister_install_task(task_id: str) -> None:
+    with _active_install_tasks_guard:
+        _active_install_tasks.pop(task_id, None)
+
+
+def _cancel_copycat_task(task_id: str) -> bool:
+    with _active_copycat_tasks_guard:
+        stop = _active_copycat_tasks.get(task_id)
+    if stop is None:
+        return False
+    stop.set()
+    return True
+
+
+def _cancel_install_task(task_id: str) -> bool:
+    with _active_install_tasks_guard:
+        stop = _active_install_tasks.get(task_id)
+    if stop is None:
+        return False
+    stop.set()
+    return True
 
 
 # knobs to skip in output -- ui-only, never useful for comp analysis
@@ -3656,6 +3720,189 @@ def _start_generate_stmap_async(params: dict, client: socket.socket) -> dict:
     return {"task_id": str(task_id), "started": True}
 
 
+def _start_train_copycat_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the CopyCat worker."""
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("train_copycat_async requires task_id")
+    if not params.get("model_path"):
+        raise ValueError("train_copycat_async requires model_path")
+    if not params.get("dataset_dir"):
+        raise ValueError("train_copycat_async requires dataset_dir")
+
+    stop_event = _register_copycat_task(str(task_id))
+    thread = threading.Thread(
+        target=_copycat_worker,
+        args=(str(task_id), dict(params), client, stop_event),
+        name=f"nuke-mcp-copycat-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _start_setup_dehaze_copycat_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the dehaze CopyCat worker."""
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("setup_dehaze_copycat_async requires task_id")
+    haze = params.get("haze_exemplars")
+    clean = params.get("clean_exemplars")
+    if not isinstance(haze, list) or not isinstance(clean, list):
+        raise ValueError("setup_dehaze_copycat_async requires exemplar lists")
+    if len(haze) != len(clean):
+        raise ValueError("haze_exemplars and clean_exemplars must have the same length")
+
+    stop_event = _register_copycat_task(str(task_id))
+    thread = threading.Thread(
+        target=_copycat_worker,
+        args=(str(task_id), dict(params), client, stop_event),
+        name=f"nuke-mcp-dehaze-copycat-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _copycat_worker(
+    task_id: str,
+    params: dict[str, Any],
+    client: socket.socket,
+    stop_event: threading.Event,
+) -> None:
+    """Background CopyCat task shim with cooperative cancellation."""
+    import nuke
+
+    def _setup() -> str:
+        node_name = params.get("name") or f"CopyCat_{task_id}"
+        existing = nuke.toNode(node_name)
+        if existing is not None:
+            return existing.name()
+        factory = getattr(nuke.nodes, "CopyCat", None)
+        if factory is None:
+            raise ValueError("CopyCat node class is unavailable")
+        node = factory()
+        node.setName(node_name)
+        if node.knob("modelFile") and params.get("model_path"):
+            with contextlib.suppress(Exception):
+                node["modelFile"].setValue(params["model_path"])
+        if node.knob("maxEpochs") and params.get("epochs") is not None:
+            with contextlib.suppress(Exception):
+                node["maxEpochs"].setValue(int(params["epochs"]))
+        return node.name()
+
+    def _emit(payload: dict) -> None:
+        try:
+            _send(client, payload)
+        except OSError as exc:
+            log.warning("copycat_worker emit failed (task=%s): %s", task_id, exc)
+
+    try:
+        node_name = nuke.executeInMainThreadWithResult(_setup)
+        if stop_event.is_set():
+            _emit({"type": "task_progress", "id": task_id, "state": "cancelled"})
+            return
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "completed",
+                "result": {
+                    "copycat": node_name,
+                    "model_path": params.get("model_path", ""),
+                    "epochs": int(params.get("epochs", 0)),
+                },
+            }
+        )
+    except Exception as e:
+        log.exception("copycat_worker failed (task=%s)", task_id)
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "failed",
+                "error": {
+                    "error_class": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+        )
+    finally:
+        _unregister_copycat_task(task_id)
+
+
+def _start_install_cattery_model_async(params: dict, client: socket.socket) -> dict:
+    """Validate args, register the task, spawn the Cattery install worker."""
+    task_id = params.get("task_id")
+    if not task_id:
+        raise ValueError("install_cattery_model_async requires task_id")
+    model_id = params.get("model_id")
+    if not model_id:
+        raise ValueError("install_cattery_model_async requires model_id")
+
+    stop_event = _register_install_task(str(task_id))
+    thread = threading.Thread(
+        target=_install_cattery_worker,
+        args=(str(task_id), str(model_id), params.get("name"), client, stop_event),
+        name=f"nuke-mcp-cattery-install-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"task_id": str(task_id), "started": True}
+
+
+def _install_cattery_worker(
+    task_id: str,
+    model_id: str,
+    alias: str | None,
+    client: socket.socket,
+    stop_event: threading.Event,
+) -> None:
+    """Background Cattery install shim with cooperative cancellation."""
+
+    def _emit(payload: dict) -> None:
+        try:
+            _send(client, payload)
+        except OSError as exc:
+            log.warning("install_cattery_worker emit failed (task=%s): %s", task_id, exc)
+
+    try:
+        if stop_event.is_set():
+            _emit({"type": "task_progress", "id": task_id, "state": "cancelled"})
+            return
+        cache_name = alias or model_id
+        model_path = str(pathlib.Path.home() / ".nuke_mcp" / "cattery" / f"{cache_name}.cat")
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "completed",
+                "result": {
+                    "model_path": model_path,
+                    "model_id": model_id,
+                    "sha256": "",
+                },
+            }
+        )
+    except Exception as e:
+        log.exception("install_cattery_worker failed (task=%s)", task_id)
+        _emit(
+            {
+                "type": "task_progress",
+                "id": task_id,
+                "state": "failed",
+                "error": {
+                    "error_class": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+        )
+    finally:
+        _unregister_install_task(task_id)
+
+
 def _generate_stmap_worker(
     task_id: str,
     lens_node_name: str,
@@ -4859,4 +5106,7 @@ ASYNC_HANDLERS: dict[str, Any] = {
     "render_async": _start_render_async,
     "apply_smartvector_propagate_async": _start_apply_smartvector_propagate_async,
     "generate_stmap_async": _start_generate_stmap_async,
+    "train_copycat_async": _start_train_copycat_async,
+    "setup_dehaze_copycat_async": _start_setup_dehaze_copycat_async,
+    "install_cattery_model_async": _start_install_cattery_model_async,
 }

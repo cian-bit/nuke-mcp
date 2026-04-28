@@ -339,3 +339,34 @@ def test_generate_stmap_redistort_mode(distortion_tools_with_taskstore):
     tools["generate_stmap"]("lens_solve", mode="redistort")
     payload = server.async_stmaps[-1]
     assert payload["mode"] == "redistort"
+
+
+def test_distortion_tasks_cancel_dispatches_to_addon(distortion_tools_with_taskstore):
+    server, _script, tools = distortion_tools_with_taskstore
+    out = tools["apply_smartvector_propagate"](
+        plate="plate", paint_frame=1, range_in=1, range_out=2
+    )
+
+    from nuke_mcp.tools import tasks as tasks_tools
+
+    class _Mcp:
+        def __init__(self) -> None:
+            self.registered = {}
+
+        def tool(self, **_kwargs):
+            def _decorator(fn):
+                self.registered[fn.__name__] = fn
+                return fn
+
+            return _decorator
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.mcp = _Mcp()
+
+    ctx = _Ctx()
+    tasks_tools.register(ctx)
+    cancelled = ctx.mcp.registered["tasks_cancel"](out["task_id"])
+
+    assert cancelled["state"] == "cancelled"
+    assert out["task_id"] in server.cancelled_renders

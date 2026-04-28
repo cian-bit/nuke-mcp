@@ -125,6 +125,8 @@ def register(ctx: ServerContext) -> None:
         # default ``read`` class.
         _CANCEL_DISPATCH: dict[str, str] = {
             "render_frames": "cancel_render",
+            "apply_smartvector_propagate": "cancel_render",
+            "generate_stmap": "cancel_render",
             "train_copycat": "cancel_copycat",
             "setup_dehaze_copycat": "cancel_copycat",
             "install_cattery_model": "cancel_install",
